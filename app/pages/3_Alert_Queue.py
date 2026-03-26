@@ -358,6 +358,42 @@ def build_reason_text(row: pd.Series, schema: Dict[str, Optional[str]]) -> str:
 def build_missing_dimension_message(label: str) -> str:
     return f"El dataset actual no incluye una dimensión utilizable de **{label}** para esta vista."
 
+def choose_best_focus_dimension(
+    df: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    preferred_order: List[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Devuelve la mejor dimensión disponible para análisis de focos.
+    Retorna (nombre_columna, etiqueta_legible).
+    """
+    label_map = {
+        "country": "país",
+        "merchant_category": "categoría de comercio",
+        "payment_type": "tipo de pago",
+        "merchant_id": "comercio",
+        "customer_id": "cliente",
+        "status": "estado",
+        "reason": "motivo",
+        "channel": "canal",
+    }
+
+    for key in preferred_order:
+        col = schema.get(key)
+        if col and col in df.columns:
+            non_null = df[col].dropna()
+            if len(non_null) > 0:
+                return col, label_map.get(key, key)
+
+    return None, None
+
+
+def safe_top_value(df: pd.DataFrame, col: Optional[str]) -> Optional[str]:
+    if col and col in df.columns:
+        vc = df[col].astype(str).value_counts(dropna=True)
+        if not vc.empty:
+            return str(vc.index[0])
+    return None
 
 # =========================================================
 # LOAD + PREPARE DATA
