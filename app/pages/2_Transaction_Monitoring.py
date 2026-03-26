@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,35 +38,49 @@ def get_data():
             "alert_queue",
             "transaction_country_summary",
             "channel_summary",
+            "executive_kpis",
         ]
     )
 
 
 data = get_data()
 
-daily_monitoring_df = data["daily_monitoring"].copy()
-daily_channel_monitoring_df = data["daily_channel_monitoring"].copy()
-scored_df = data["dashboard_scored_transactions"].copy()
-alert_queue_df = data["alert_queue"].copy()
-country_summary_df = data["transaction_country_summary"].copy()
-channel_summary_df = data["channel_summary"].copy()
+daily_monitoring_df = data.get("daily_monitoring", pd.DataFrame()).copy()
+daily_channel_monitoring_df = data.get("daily_channel_monitoring", pd.DataFrame()).copy()
+scored_df = data.get("dashboard_scored_transactions", pd.DataFrame()).copy()
+alert_queue_df = data.get("alert_queue", pd.DataFrame()).copy()
+country_summary_df = data.get("transaction_country_summary", pd.DataFrame()).copy()
+channel_summary_df = data.get("channel_summary", pd.DataFrame()).copy()
+executive_kpis_df = data.get("executive_kpis", pd.DataFrame()).copy()
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
+ISO2_TO_ISO3 = {
+    "AL": "ALB", "AD": "AND", "AT": "AUT", "BY": "BLR", "BE": "BEL", "BA": "BIH",
+    "BG": "BGR", "HR": "HRV", "CY": "CYP", "CZ": "CZE", "DK": "DNK", "EE": "EST",
+    "FI": "FIN", "FR": "FRA", "DE": "DEU", "GR": "GRC", "HU": "HUN", "IS": "ISL",
+    "IE": "IRL", "IT": "ITA", "XK": "XKX", "LV": "LVA", "LI": "LIE", "LT": "LTU",
+    "LU": "LUX", "MT": "MLT", "MD": "MDA", "MC": "MCO", "ME": "MNE", "NL": "NLD",
+    "MK": "MKD", "NO": "NOR", "PL": "POL", "PT": "PRT", "RO": "ROU", "RU": "RUS",
+    "SM": "SMR", "RS": "SRB", "SK": "SVK", "SI": "SVN", "ES": "ESP", "SE": "SWE",
+    "CH": "CHE", "TR": "TUR", "UA": "UKR", "GB": "GBR", "UK": "GBR",
+}
+
+RISK_ORDER = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
     return out
-
-
-def first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return None
 
 
 def first_existing_column_case_insensitive(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -99,214 +115,106 @@ def safe_divide(a, b):
     return a / b
 
 
+def info_box(text: str):
+    st.caption(text)
+
+
+def extract_kpi_value(df: pd.DataFrame, candidate_keys: list[str]) -> float | None:
+    if df is None or df.empty:
+        return None
+
+    normalized_keys = {str(k).strip().lower() for k in candidate_keys}
+    wide_col_map = {str(c).strip().lower(): c for c in df.columns}
+
+    for key in candidate_keys:
+        col = wide_col_map.get(str(key).strip().lower())
+        if col is not None:
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if not series.empty:
+                return float(series.iloc[0])
+
+    possible_key_cols = ["metric", "kpi", "key", "name", "metric_name", "kpi_name"]
+    possible_value_cols = ["value", "metric_value", "kpi_value", "metric_result", "score"]
+
+    key_col = first_existing_column_case_insensitive(df, possible_key_cols)
+    value_col = first_existing_column_case_insensitive(df, possible_value_cols)
+
+    if key_col is not None and value_col is not None:
+        tmp = df.copy()
+        tmp[key_col] = tmp[key_col].astype(str).str.strip().str.lower()
+        match = tmp[tmp[key_col].isin(normalized_keys)]
+        if not match.empty:
+            series = pd.to_numeric(match[value_col], errors="coerce").dropna()
+            if not series.empty:
+                return float(series.iloc[0])
+
+    return None
+
+
 def infer_daily_columns(df: pd.DataFrame) -> dict:
     df = normalize_columns(df)
 
-    date_col = first_existing_column_case_insensitive(
-        df,
-        ["transaction_date", "date", "day", "business_date", "event_date"],
-    )
-
-    tx_col = first_existing_column_case_insensitive(
-        df,
-        ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"],
-    )
-
-    alerts_col = first_existing_column_case_insensitive(
-        df,
-        ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"],
-    )
-
-    alert_rate_col = first_existing_column_case_insensitive(
-        df,
-        ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"],
-    )
-
-    avg_score_col = first_existing_column_case_insensitive(
-        df,
-        ["avg_score", "average_score", "mean_score", "avg_risk_score", "mean_risk_score"],
-    )
-
     return {
-        "date_col": date_col,
-        "tx_col": tx_col,
-        "alerts_col": alerts_col,
-        "alert_rate_col": alert_rate_col,
-        "avg_score_col": avg_score_col,
+        "date_col": first_existing_column_case_insensitive(df, ["transaction_date", "date", "day", "business_date", "event_date"]),
+        "tx_col": first_existing_column_case_insensitive(df, ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"]),
+        "alerts_col": first_existing_column_case_insensitive(df, ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"]),
+        "alert_rate_col": first_existing_column_case_insensitive(df, ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"]),
+        "avg_score_col": first_existing_column_case_insensitive(df, ["avg_score", "average_score", "mean_score", "avg_risk_score", "mean_risk_score"]),
     }
 
 
 def infer_channel_columns(df: pd.DataFrame) -> dict:
     df = normalize_columns(df)
 
-    date_col = first_existing_column_case_insensitive(
-        df,
-        ["transaction_date", "date", "day", "business_date", "event_date"],
-    )
-
-    channel_col = first_existing_column_case_insensitive(
-        df,
-        ["channel", "transaction_channel", "payment_channel"],
-    )
-
-    tx_col = first_existing_column_case_insensitive(
-        df,
-        ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"],
-    )
-
-    alerts_col = first_existing_column_case_insensitive(
-        df,
-        ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"],
-    )
-
-    alert_rate_col = first_existing_column_case_insensitive(
-        df,
-        ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"],
-    )
-
     return {
-        "date_col": date_col,
-        "channel_col": channel_col,
-        "tx_col": tx_col,
-        "alerts_col": alerts_col,
-        "alert_rate_col": alert_rate_col,
+        "date_col": first_existing_column_case_insensitive(df, ["transaction_date", "date", "day", "business_date", "event_date"]),
+        "channel_col": first_existing_column_case_insensitive(df, ["channel", "transaction_channel", "payment_channel"]),
+        "tx_col": first_existing_column_case_insensitive(df, ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"]),
+        "alerts_col": first_existing_column_case_insensitive(df, ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"]),
+        "alert_rate_col": first_existing_column_case_insensitive(df, ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"]),
     }
 
 
 def infer_scored_columns(df: pd.DataFrame) -> dict:
     df = normalize_columns(df)
 
-    date_col = first_existing_column_case_insensitive(
-        df,
-        ["transaction_ts", "transaction_date", "date", "timestamp", "event_date"],
-    )
-
-    channel_col = first_existing_column_case_insensitive(
-        df,
-        ["channel", "transaction_channel", "payment_channel"],
-    )
-
-    country_col = first_existing_column_case_insensitive(
-        df,
-        ["transaction_country", "country", "merchant_country", "issuer_country"],
-    )
-
-    cross_border_col = first_existing_column_case_insensitive(
-        df,
-        ["is_cross_border", "cross_border_flag", "cross_border", "international_flag"],
-    )
-
-    score_col = first_existing_column_case_insensitive(
-        df,
-        ["fraud_score", "score", "prediction_score", "risk_score", "model_score"],
-    )
-
-    fraud_label_col = first_existing_column_case_insensitive(
-        df,
-        ["fraud_label", "label", "is_fraud", "target"],
-    )
-
-    amount_col = first_existing_column_case_insensitive(
-        df,
-        ["amount", "transaction_amount", "payment_amount", "amount_usd", "amount_eur"],
-    )
-
-    payment_type_col = first_existing_column_case_insensitive(
-        df,
-        ["payment_type", "payment_method_type", "payment_method", "card_type"],
-    )
-
-    merchant_category_col = first_existing_column_case_insensitive(
-        df,
-        ["merchant_category", "merchant_mcc_group", "merchant_segment", "merchant_type"],
-    )
-
-    risk_bucket_col = first_existing_column_case_insensitive(
-        df,
-        ["risk_bucket", "risk_segment", "score_bucket", "bucket"],
-    )
-
     return {
-        "date_col": date_col,
-        "channel_col": channel_col,
-        "country_col": country_col,
-        "cross_border_col": cross_border_col,
-        "score_col": score_col,
-        "fraud_label_col": fraud_label_col,
-        "amount_col": amount_col,
-        "payment_type_col": payment_type_col,
-        "merchant_category_col": merchant_category_col,
-        "risk_bucket_col": risk_bucket_col,
+        "date_col": first_existing_column_case_insensitive(df, ["transaction_ts", "transaction_date", "date", "timestamp", "event_date"]),
+        "channel_col": first_existing_column_case_insensitive(df, ["channel", "transaction_channel", "payment_channel"]),
+        "country_col": first_existing_column_case_insensitive(df, ["transaction_country", "country", "merchant_country", "issuer_country"]),
+        "cross_border_col": first_existing_column_case_insensitive(df, ["is_cross_border", "cross_border_flag", "cross_border", "international_flag"]),
+        "score_col": first_existing_column_case_insensitive(df, ["fraud_score", "score", "prediction_score", "risk_score", "model_score"]),
+        "fraud_label_col": first_existing_column_case_insensitive(df, ["fraud_label", "label", "is_fraud", "target"]),
+        "amount_col": first_existing_column_case_insensitive(df, ["amount", "transaction_amount", "payment_amount", "amount_usd", "amount_eur"]),
+        "payment_type_col": first_existing_column_case_insensitive(df, ["payment_type", "payment_method_type", "payment_method", "card_type"]),
+        "merchant_category_col": first_existing_column_case_insensitive(df, ["merchant_category", "merchant_mcc_group", "merchant_segment", "merchant_type"]),
+        "risk_bucket_col": first_existing_column_case_insensitive(df, ["risk_bucket", "risk_segment", "score_bucket", "bucket"]),
     }
 
 
 def infer_country_summary_columns(df: pd.DataFrame) -> dict:
     df = normalize_columns(df)
 
-    country_col = first_existing_column_case_insensitive(
-        df,
-        ["transaction_country", "country", "merchant_country"],
-    )
-
-    tx_col = first_existing_column_case_insensitive(
-        df,
-        ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"],
-    )
-
-    alerts_col = first_existing_column_case_insensitive(
-        df,
-        ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"],
-    )
-
-    alert_rate_col = first_existing_column_case_insensitive(
-        df,
-        ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"],
-    )
-
     return {
-        "country_col": country_col,
-        "tx_col": tx_col,
-        "alerts_col": alerts_col,
-        "alert_rate_col": alert_rate_col,
+        "country_col": first_existing_column_case_insensitive(df, ["transaction_country", "country", "merchant_country"]),
+        "tx_col": first_existing_column_case_insensitive(df, ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"]),
+        "alerts_col": first_existing_column_case_insensitive(df, ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"]),
+        "alert_rate_col": first_existing_column_case_insensitive(df, ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"]),
     }
 
 
 def infer_channel_summary_columns(df: pd.DataFrame) -> dict:
     df = normalize_columns(df)
 
-    channel_col = first_existing_column_case_insensitive(
-        df,
-        ["channel", "transaction_channel", "payment_channel"],
-    )
-
-    tx_col = first_existing_column_case_insensitive(
-        df,
-        ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"],
-    )
-
-    alerts_col = first_existing_column_case_insensitive(
-        df,
-        ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"],
-    )
-
-    alert_rate_col = first_existing_column_case_insensitive(
-        df,
-        ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"],
-    )
-
     return {
-        "channel_col": channel_col,
-        "tx_col": tx_col,
-        "alerts_col": alerts_col,
-        "alert_rate_col": alert_rate_col,
+        "channel_col": first_existing_column_case_insensitive(df, ["channel", "transaction_channel", "payment_channel"]),
+        "tx_col": first_existing_column_case_insensitive(df, ["transactions", "transaction_count", "total_transactions", "tx_count", "n_transactions"]),
+        "alerts_col": first_existing_column_case_insensitive(df, ["alerts", "alert_count", "total_alerts", "n_alerts", "flagged_transactions"]),
+        "alert_rate_col": first_existing_column_case_insensitive(df, ["alert_rate", "alerts_rate", "fraud_alert_rate", "flag_rate"]),
     }
 
 
-def build_daily_from_scored(
-    scored_data: pd.DataFrame,
-    alert_data: pd.DataFrame,
-    scored_meta: dict,
-) -> pd.DataFrame:
+def build_daily_from_scored(scored_data: pd.DataFrame, alert_data: pd.DataFrame, scored_meta: dict) -> pd.DataFrame:
     if scored_data.empty:
         return pd.DataFrame()
 
@@ -389,15 +297,10 @@ def build_channel_summary_from_daily_channel(df: pd.DataFrame, meta: dict) -> pd
         ascending=False,
     ).reset_index(drop=True)
 
-    summary = summary.rename(columns={channel_col: "channel"})
-    return summary
+    return summary.rename(columns={channel_col: "channel"})
 
 
-def build_country_summary_from_scored(
-    scored_data: pd.DataFrame,
-    alert_data: pd.DataFrame,
-    scored_meta: dict,
-) -> pd.DataFrame:
+def build_country_summary_from_scored(scored_data: pd.DataFrame, alert_data: pd.DataFrame, scored_meta: dict) -> pd.DataFrame:
     if scored_data.empty:
         return pd.DataFrame()
 
@@ -477,27 +380,7 @@ def compute_cross_border_summary(scored_data: pd.DataFrame, alert_data: pd.DataF
     return out.sort_values("alerts", ascending=False).reset_index(drop=True)
 
 
-def apply_date_filter(df: pd.DataFrame, date_col: Optional[str], start_date, end_date) -> pd.DataFrame:
-    if df.empty or date_col is None or date_col not in df.columns:
-        return df.copy()
-
-    out = df.copy()
-    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    out = out[out[date_col].notna()].copy()
-    return out[
-        (out[date_col] >= pd.to_datetime(start_date)) &
-        (out[date_col] <= pd.to_datetime(end_date))
-    ].copy()
-
-
-def apply_scored_filters(
-    df: pd.DataFrame,
-    meta: dict,
-    start_date=None,
-    end_date=None,
-    selected_channels=None,
-    selected_countries=None,
-) -> pd.DataFrame:
+def apply_scored_filters(df: pd.DataFrame, meta: dict, start_date=None, end_date=None, selected_channels=None, selected_countries=None) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
         return out
@@ -523,7 +406,7 @@ def apply_scored_filters(
     return out
 
 
-def build_score_distribution(df: pd.DataFrame, score_col: Optional[str], bins: int = 20) -> pd.DataFrame:
+def build_score_distribution(df: pd.DataFrame, score_col: Optional[str], bins: int = 25) -> pd.DataFrame:
     if df.empty or score_col is None or score_col not in df.columns:
         return pd.DataFrame()
 
@@ -564,27 +447,25 @@ def build_payment_type_alerts(df: pd.DataFrame, payment_col: Optional[str]) -> p
     if df.empty or payment_col is None or payment_col not in df.columns:
         return pd.DataFrame()
 
-    out = (
+    return (
         df.groupby(payment_col, as_index=False)
         .size()
         .rename(columns={payment_col: "payment_type", "size": "alerts"})
         .sort_values("alerts", ascending=False)
     )
-    return out
 
 
 def build_merchant_category_alerts(df: pd.DataFrame, category_col: Optional[str], top_n: int = 15) -> pd.DataFrame:
     if df.empty or category_col is None or category_col not in df.columns:
         return pd.DataFrame()
 
-    out = (
+    return (
         df.groupby(category_col, as_index=False)
         .size()
         .rename(columns={category_col: "merchant_category", "size": "alerts"})
         .sort_values("alerts", ascending=False)
         .head(top_n)
     )
-    return out
 
 
 def build_weekday_alerts(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
@@ -599,21 +480,15 @@ def build_weekday_alerts(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFr
 
     weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     weekday_map_es = {
-        "Monday": "Lunes",
-        "Tuesday": "Martes",
-        "Wednesday": "Miércoles",
-        "Thursday": "Jueves",
-        "Friday": "Viernes",
-        "Saturday": "Sábado",
-        "Sunday": "Domingo",
+        "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles",
+        "Thursday": "Jueves", "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo",
     }
 
     out["weekday"] = out[date_col].dt.day_name()
     summary = out.groupby("weekday", as_index=False).size().rename(columns={"size": "alerts"})
     summary["weekday_order"] = summary["weekday"].map({d: i for i, d in enumerate(weekday_order)})
     summary["día_semana"] = summary["weekday"].map(weekday_map_es)
-    summary = summary.sort_values("weekday_order")[["día_semana", "alerts"]]
-    return summary
+    return summary.sort_values("weekday_order")[["día_semana", "alerts"]]
 
 
 def build_hourly_alerts(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
@@ -627,8 +502,7 @@ def build_hourly_alerts(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFra
         return pd.DataFrame()
 
     out["hour"] = out[date_col].dt.hour
-    summary = out.groupby("hour", as_index=False).size().rename(columns={"size": "alerts"})
-    return summary.sort_values("hour")
+    return out.groupby("hour", as_index=False).size().rename(columns={"size": "alerts"}).sort_values("hour")
 
 
 def build_channel_scatter_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -640,8 +514,144 @@ def build_channel_scatter_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["transactions", "alerts", "alert_rate"]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    out = out.dropna(subset=["transactions", "alerts", "alert_rate"]).copy()
+    return out.dropna(subset=["transactions", "alerts", "alert_rate"]).copy()
+
+
+def build_channel_heatmap(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    required = {"monitoring_date", "channel", metric_col}
+    if df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["monitoring_date"] = pd.to_datetime(out["monitoring_date"], errors="coerce")
+    out = out[out["monitoring_date"].notna()].copy()
+    out["monitoring_date"] = out["monitoring_date"].dt.strftime("%Y-%m-%d")
+    pivot = out.pivot_table(index="channel", columns="monitoring_date", values=metric_col, aggfunc="sum")
+    return pivot.fillna(0)
+
+
+def build_channel_share_over_time(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    required = {"monitoring_date", "channel", metric_col}
+    if df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["monitoring_date"] = pd.to_datetime(out["monitoring_date"], errors="coerce")
+    out = out[out["monitoring_date"].notna()].copy()
+    out[metric_col] = pd.to_numeric(out[metric_col], errors="coerce")
+    out = out[out[metric_col].notna()].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    total_per_day = out.groupby("monitoring_date")[metric_col].sum().rename("daily_total").reset_index()
+    out = out.merge(total_per_day, on="monitoring_date", how="left")
+    out["share"] = out[metric_col] / out["daily_total"]
     return out
+
+
+def build_geo_metric_df(
+    scored_filtered: pd.DataFrame,
+    alert_filtered: pd.DataFrame,
+    meta: dict,
+) -> pd.DataFrame:
+    country_col = meta["country_col"]
+    amount_col = meta["amount_col"]
+
+    if country_col is None or country_col not in scored_filtered.columns:
+        return pd.DataFrame()
+
+    tx = (
+        scored_filtered.groupby(country_col, as_index=False)
+        .size()
+        .rename(columns={country_col: "country", "size": "transactions"})
+    )
+
+    if amount_col is not None and amount_col in scored_filtered.columns:
+        tmp = scored_filtered.copy()
+        tmp[amount_col] = pd.to_numeric(tmp[amount_col], errors="coerce")
+        amt = tmp.groupby(country_col, as_index=False)[amount_col].sum().rename(
+            columns={country_col: "country", amount_col: "importe_total"}
+        )
+        tx = tx.merge(amt, on="country", how="left")
+    else:
+        tx["importe_total"] = None
+
+    if not alert_filtered.empty and country_col in alert_filtered.columns:
+        al = (
+            alert_filtered.groupby(country_col, as_index=False)
+            .size()
+            .rename(columns={country_col: "country", "size": "alerts"})
+        )
+        tx = tx.merge(al, on="country", how="left")
+    else:
+        tx["alerts"] = 0
+
+    tx["alerts"] = tx["alerts"].fillna(0)
+    tx["alert_rate"] = tx["alerts"] / tx["transactions"]
+    tx["country"] = tx["country"].astype(str).str.upper()
+    tx["iso_alpha"] = tx["country"].map(ISO2_TO_ISO3)
+    tx = tx[tx["iso_alpha"].notna()].copy()
+    return tx.sort_values("alerts", ascending=False)
+
+
+def build_risk_bucket_summary(scored_filtered: pd.DataFrame, alert_filtered: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    bucket_col = meta["risk_bucket_col"]
+    amount_col = meta["amount_col"]
+    score_col = meta["score_col"]
+
+    if bucket_col is None or bucket_col not in scored_filtered.columns:
+        return pd.DataFrame()
+
+    tmp = scored_filtered.copy()
+    group_cols = [bucket_col]
+
+    agg = {bucket_col: "size"}
+    rename_map = {bucket_col: "bucket_riesgo"}
+
+    # transactions
+    tx = (
+        tmp.groupby(bucket_col, as_index=False)
+        .size()
+        .rename(columns={bucket_col: "bucket_riesgo", "size": "transactions"})
+    )
+
+    if amount_col is not None and amount_col in tmp.columns:
+        tmp[amount_col] = pd.to_numeric(tmp[amount_col], errors="coerce")
+        amt = (
+            tmp.groupby(bucket_col, as_index=False)[amount_col]
+            .sum()
+            .rename(columns={bucket_col: "bucket_riesgo", amount_col: "importe_total"})
+        )
+        tx = tx.merge(amt, on="bucket_riesgo", how="left")
+    else:
+        tx["importe_total"] = None
+
+    if score_col is not None and score_col in tmp.columns:
+        tmp[score_col] = pd.to_numeric(tmp[score_col], errors="coerce")
+        sc = (
+            tmp.groupby(bucket_col, as_index=False)[score_col]
+            .mean()
+            .rename(columns={bucket_col: "bucket_riesgo", score_col: "score_medio"})
+        )
+        tx = tx.merge(sc, on="bucket_riesgo", how="left")
+    else:
+        tx["score_medio"] = None
+
+    if not alert_filtered.empty and bucket_col in alert_filtered.columns:
+        al = (
+            alert_filtered.groupby(bucket_col, as_index=False)
+            .size()
+            .rename(columns={bucket_col: "bucket_riesgo", "size": "alerts"})
+        )
+        tx = tx.merge(al, on="bucket_riesgo", how="left")
+    else:
+        tx["alerts"] = 0
+
+    tx["alerts"] = tx["alerts"].fillna(0)
+    tx["alert_rate"] = tx["alerts"] / tx["transactions"]
+    tx["bucket_order"] = tx["bucket_riesgo"].astype(str).str.lower().map(RISK_ORDER).fillna(999)
+    tx = tx.sort_values(["bucket_order", "alerts"], ascending=[True, False]).reset_index(drop=True)
+    return tx
 
 
 def make_exec_reading(
@@ -650,7 +660,6 @@ def make_exec_reading(
     country_df: pd.DataFrame,
     cross_df: pd.DataFrame,
     scored_filtered_df: pd.DataFrame,
-    alert_filtered_df: pd.DataFrame,
     scored_meta: dict,
 ) -> List[str]:
     insights = []
@@ -661,20 +670,17 @@ def make_exec_reading(
 
         if len(last_7) > 0:
             last_alert_rate = pd.to_numeric(last_7["alert_rate"], errors="coerce").mean()
-
             if len(prev_7) > 0:
                 prev_alert_rate = pd.to_numeric(prev_7["alert_rate"], errors="coerce").mean()
                 if pd.notna(last_alert_rate) and pd.notna(prev_alert_rate):
                     delta = last_alert_rate - prev_alert_rate
                     if delta > 0.002:
                         insights.append(
-                            f"El alert rate medio de los últimos 7 días sube frente a la ventana anterior "
-                            f"({last_alert_rate:.2%} vs {prev_alert_rate:.2%})."
+                            f"El alert rate medio de los últimos 7 días sube frente a la ventana anterior ({last_alert_rate:.2%} vs {prev_alert_rate:.2%})."
                         )
                     elif delta < -0.002:
                         insights.append(
-                            f"El alert rate medio de los últimos 7 días baja frente a la ventana anterior "
-                            f"({last_alert_rate:.2%} vs {prev_alert_rate:.2%})."
+                            f"El alert rate medio de los últimos 7 días baja frente a la ventana anterior ({last_alert_rate:.2%} vs {prev_alert_rate:.2%})."
                         )
                     else:
                         insights.append(
@@ -760,6 +766,7 @@ scored_df = normalize_columns(scored_df)
 alert_queue_df = normalize_columns(alert_queue_df)
 country_summary_df = normalize_columns(country_summary_df)
 channel_summary_df = normalize_columns(channel_summary_df)
+executive_kpis_df = normalize_columns(executive_kpis_df)
 
 daily_meta = infer_daily_columns(daily_monitoring_df)
 daily_channel_meta = infer_channel_columns(daily_channel_monitoring_df)
@@ -767,10 +774,16 @@ scored_meta = infer_scored_columns(scored_df)
 country_meta = infer_country_summary_columns(country_summary_df)
 channel_meta = infer_channel_summary_columns(channel_summary_df)
 
+champion_threshold = extract_kpi_value(
+    executive_kpis_df,
+    candidate_keys=["champion_threshold", "selected_threshold", "operating_threshold", "model_threshold"],
+)
+if champion_threshold is None:
+    champion_threshold = 0.8987
+
 if not daily_monitoring_df.empty and daily_meta["date_col"] is not None:
     daily_monitoring_df[daily_meta["date_col"]] = pd.to_datetime(
-        daily_monitoring_df[daily_meta["date_col"]],
-        errors="coerce",
+        daily_monitoring_df[daily_meta["date_col"]], errors="coerce"
     )
 
     for c in [daily_meta["tx_col"], daily_meta["alerts_col"], daily_meta["alert_rate_col"], daily_meta["avg_score_col"]]:
@@ -778,9 +791,7 @@ if not daily_monitoring_df.empty and daily_meta["date_col"] is not None:
             daily_monitoring_df[c] = pd.to_numeric(daily_monitoring_df[c], errors="coerce")
 
     if daily_meta["alert_rate_col"] is None and daily_meta["tx_col"] and daily_meta["alerts_col"]:
-        daily_monitoring_df["alert_rate"] = (
-            daily_monitoring_df[daily_meta["alerts_col"]] / daily_monitoring_df[daily_meta["tx_col"]]
-        )
+        daily_monitoring_df["alert_rate"] = daily_monitoring_df[daily_meta["alerts_col"]] / daily_monitoring_df[daily_meta["tx_col"]]
         daily_meta["alert_rate_col"] = "alert_rate"
 
     rename_map = {}
@@ -802,8 +813,7 @@ else:
 
 if not daily_channel_monitoring_df.empty and daily_channel_meta["date_col"] is not None:
     daily_channel_monitoring_df[daily_channel_meta["date_col"]] = pd.to_datetime(
-        daily_channel_monitoring_df[daily_channel_meta["date_col"]],
-        errors="coerce",
+        daily_channel_monitoring_df[daily_channel_meta["date_col"]], errors="coerce"
     )
     for c in [daily_channel_meta["tx_col"], daily_channel_meta["alerts_col"], daily_channel_meta["alert_rate_col"]]:
         if c is not None and c in daily_channel_monitoring_df.columns:
@@ -811,7 +821,8 @@ if not daily_channel_monitoring_df.empty and daily_channel_meta["date_col"] is n
 
     if daily_channel_meta["alert_rate_col"] is None and daily_channel_meta["tx_col"] and daily_channel_meta["alerts_col"]:
         daily_channel_monitoring_df["alert_rate"] = (
-            daily_channel_monitoring_df[daily_channel_meta["alerts_col"]] / daily_channel_monitoring_df[daily_channel_meta["tx_col"]]
+            daily_channel_monitoring_df[daily_channel_meta["alerts_col"]] /
+            daily_channel_monitoring_df[daily_channel_meta["tx_col"]]
         )
         daily_channel_meta["alert_rate_col"] = "alert_rate"
 
@@ -938,16 +949,37 @@ with st.sidebar:
         default=available_countries[:10] if len(available_countries) > 10 else available_countries,
     )
 
+    geo_metric = st.selectbox(
+        "Métrica del mapa",
+        options=["alerts", "alert_rate", "transactions", "importe_total"],
+        format_func=lambda x: {
+            "alerts": "Alertas",
+            "alert_rate": "Alert rate",
+            "transactions": "Transacciones",
+            "importe_total": "Importe total",
+        }[x],
+    )
+
+    heatmap_metric = st.radio(
+        "Heatmap por canal",
+        options=["alerts", "transactions", "alert_rate"],
+        horizontal=False,
+        format_func=lambda x: {
+            "alerts": "Alertas",
+            "transactions": "Transacciones",
+            "alert_rate": "Alert rate",
+        }[x],
+    )
+
     st.markdown("---")
     st.markdown(
         """
         **Objetivo de esta página**
         
         - vigilar el comportamiento diario del flujo
-        - medir presión de alertado
-        - localizar focos por canal y geografía
-        - identificar exposición económica
-        - detectar patrones de concentración operativa
+        - detectar focos por canal, país y franja temporal
+        - entender dónde se concentra el importe expuesto
+        - traducir el riesgo modelizado a decisiones operativas
         """
     )
 
@@ -1015,6 +1047,8 @@ alert_filtered = apply_scored_filters(
 )
 
 cross_border_summary_filtered = compute_cross_border_summary(scored_filtered, alert_filtered, scored_meta)
+geo_metric_df = build_geo_metric_df(scored_filtered, alert_filtered, scored_meta)
+risk_bucket_summary_df = build_risk_bucket_summary(scored_filtered, alert_filtered, scored_meta)
 
 
 # =========================================================
@@ -1050,11 +1084,11 @@ if not daily_filtered.empty:
             peak_alerts = peak_row.iloc[0]["alerts"]
 
 if total_transactions in [None, 0] or pd.isna(total_transactions):
-    if scored_filtered is not None and not scored_filtered.empty:
+    if not scored_filtered.empty:
         total_transactions = len(scored_filtered)
 
 if total_alerts in [None] or pd.isna(total_alerts):
-    if alert_filtered is not None and not alert_filtered.empty:
+    if not alert_filtered.empty:
         total_alerts = len(alert_filtered)
 
 if (alert_rate is None or pd.isna(alert_rate)) and total_transactions not in [None, 0] and total_alerts is not None:
@@ -1094,14 +1128,7 @@ if peak_alert_day is not None:
 
 st.info(
     """
-    **Cómo interpretar esta cabecera**
-    
-    - **Transacciones**: volumen total observado en la ventana filtrada.
-    - **Alertas**: transacciones que han superado el punto de corte operativo.
-    - **Alert rate**: presión relativa de alertado sobre el flujo total.
-    - **Score medio**: nivel medio de riesgo estimado por el modelo.
-    - **Pico de alertas**: jornada de mayor tensión operativa.
-    - **Importe alertado**: volumen económico total asociado a la cola de alertas.
+    **Cómo leer esta cabecera:** resume el tamaño del flujo, la presión de alertado, el nivel medio de riesgo y el importe económico asociado a la cola priorizada.
     """
 )
 
@@ -1120,7 +1147,6 @@ exec_insights = make_exec_reading(
     country_df=country_summary_filtered,
     cross_df=cross_border_summary_filtered,
     scored_filtered_df=scored_filtered,
-    alert_filtered_df=alert_filtered,
     scored_meta=scored_meta,
 )
 
@@ -1141,43 +1167,49 @@ st.markdown("---")
 
 
 # =========================================================
-# TIME SERIES
+# TIME EVOLUTION
 # =========================================================
 
 st.markdown("## Evolución temporal")
+info_box("Mira aquí la dinámica del sistema: volumen, alertas y alert rate. Sirve para detectar cambios de régimen, picos operativos y periodos anómalos.")
 
 if daily_filtered.empty:
     st.warning("No hay datos de monitoring diario disponibles para la ventana seleccionada.")
 else:
-    ts1, ts2 = st.columns(2)
+    combo_fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if {"monitoring_date", "alerts"}.issubset(daily_filtered.columns):
+        combo_fig.add_trace(
+            go.Bar(
+                x=daily_filtered["monitoring_date"],
+                y=daily_filtered["alerts"],
+                name="Alertas",
+                opacity=0.55,
+            ),
+            secondary_y=False,
+        )
+    if {"monitoring_date", "transactions"}.issubset(daily_filtered.columns):
+        combo_fig.add_trace(
+            go.Scatter(
+                x=daily_filtered["monitoring_date"],
+                y=daily_filtered["transactions"],
+                mode="lines+markers",
+                name="Transacciones",
+            ),
+            secondary_y=True,
+        )
+    combo_fig.update_layout(
+        title="Volumen y alertas en el tiempo",
+        xaxis_title="Fecha",
+        yaxis_title="Alertas",
+        yaxis2_title="Transacciones",
+        height=470,
+        legend_title_text="Métrica",
+    )
+    st.plotly_chart(combo_fig, use_container_width=True)
 
-    with ts1:
-        if {"monitoring_date", "transactions"}.issubset(daily_filtered.columns):
-            fig_tx = px.line(
-                daily_filtered,
-                x="monitoring_date",
-                y="transactions",
-                markers=True,
-                title="Transacciones por día",
-            )
-            fig_tx.update_layout(xaxis_title="Fecha", yaxis_title="Nº transacciones", height=420)
-            st.plotly_chart(fig_tx, use_container_width=True)
+    t1, t2 = st.columns(2)
 
-    with ts2:
-        if {"monitoring_date", "alerts"}.issubset(daily_filtered.columns):
-            fig_alerts = px.line(
-                daily_filtered,
-                x="monitoring_date",
-                y="alerts",
-                markers=True,
-                title="Alertas por día",
-            )
-            fig_alerts.update_layout(xaxis_title="Fecha", yaxis_title="Nº alertas", height=420)
-            st.plotly_chart(fig_alerts, use_container_width=True)
-
-    ts3, ts4 = st.columns(2)
-
-    with ts3:
+    with t1:
         if {"monitoring_date", "alert_rate"}.issubset(daily_filtered.columns):
             fig_alert_rate = px.area(
                 daily_filtered,
@@ -1189,11 +1221,11 @@ else:
                 xaxis_title="Fecha",
                 yaxis_title="Alert rate",
                 yaxis_tickformat=".2%",
-                height=420,
+                height=400,
             )
             st.plotly_chart(fig_alert_rate, use_container_width=True)
 
-    with ts4:
+    with t2:
         if {"monitoring_date", "avg_score"}.issubset(daily_filtered.columns):
             fig_score = px.line(
                 daily_filtered,
@@ -1205,7 +1237,7 @@ else:
             fig_score.update_layout(
                 xaxis_title="Fecha",
                 yaxis_title="Score medio",
-                height=420,
+                height=400,
             )
             st.plotly_chart(fig_score, use_container_width=True)
 
@@ -1213,10 +1245,11 @@ st.markdown("---")
 
 
 # =========================================================
-# CHANNEL ANALYSIS
+# CHANNEL EVOLUTION
 # =========================================================
 
-st.markdown("## Análisis por canal")
+st.markdown("## Evolución por canal")
+info_box("Esta sección permite distinguir entre canales con mucho volumen absoluto y canales con una intensidad relativa de riesgo más alta de lo normal.")
 
 if channel_summary_filtered.empty:
     st.info("No hay resumen por canal disponible.")
@@ -1233,8 +1266,8 @@ else:
             )
             fig_channel_alerts.update_layout(
                 xaxis_title="Canal",
-                yaxis_title="Nº alertas",
-                height=420,
+                yaxis_title="Alertas",
+                height=400,
             )
             st.plotly_chart(fig_channel_alerts, use_container_width=True)
 
@@ -1250,7 +1283,7 @@ else:
                 xaxis_title="Canal",
                 yaxis_title="Alert rate",
                 yaxis_tickformat=".2%",
-                height=420,
+                height=400,
             )
             st.plotly_chart(fig_channel_rate, use_container_width=True)
 
@@ -1269,59 +1302,60 @@ else:
             xaxis_title="Transacciones",
             yaxis_title="Alert rate",
             yaxis_tickformat=".2%",
-            height=500,
+            height=480,
         )
         st.plotly_chart(fig_scatter_channel, use_container_width=True)
-
-    st.caption(
-        "Este bloque permite distinguir entre canales con mucho volumen absoluto de alertas y canales con una tasa relativa de alertado especialmente alta."
-    )
-
-    if {"channel", "transactions", "alerts", "alert_rate"}.issubset(channel_summary_filtered.columns):
-        show_channel_df = channel_summary_filtered.copy()
-        show_channel_df["alert_rate"] = show_channel_df["alert_rate"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
-        st.dataframe(show_channel_df, use_container_width=True, hide_index=True)
-
-st.markdown("---")
-
-
-# =========================================================
-# DAILY CHANNEL TREND
-# =========================================================
-
-st.markdown("## Tendencia diaria por canal")
 
 if daily_channel_filtered.empty:
     st.info("No hay datos diarios por canal disponibles.")
 else:
-    metric_option = st.radio(
-        "Métrica a visualizar",
-        options=["transactions", "alerts", "alert_rate"],
-        horizontal=True,
-        format_func=lambda x: {
-            "transactions": "Transacciones",
-            "alerts": "Alertas",
-            "alert_rate": "Alert rate",
-        }[x],
-    )
+    st.markdown("### Heatmap canal × fecha")
+    info_box("Cuanto más intensa la celda, mayor concentración de la métrica en ese canal y ese día. Es una forma rápida de detectar focos persistentes o picos aislados.")
 
-    if {"monitoring_date", "channel", metric_option}.issubset(daily_channel_filtered.columns):
-        fig_daily_channel = px.line(
-            daily_channel_filtered,
-            x="monitoring_date",
-            y=metric_option,
-            color="channel",
-            markers=False,
-            title=f"Tendencia diaria por canal · {metric_option}",
+    heatmap_df = build_channel_heatmap(daily_channel_filtered, heatmap_metric)
+    if not heatmap_df.empty:
+        fig_heatmap = go.Figure(
+            data=go.Heatmap(
+                z=heatmap_df.values,
+                x=list(heatmap_df.columns),
+                y=list(heatmap_df.index),
+                hoverongaps=False,
+            )
         )
-        fig_daily_channel.update_layout(
+        fig_heatmap.update_layout(
+            title=f"Heatmap por canal · {heatmap_metric}",
             xaxis_title="Fecha",
-            yaxis_title=metric_option,
-            height=460,
+            yaxis_title="Canal",
+            height=430,
         )
-        if metric_option == "alert_rate":
-            fig_daily_channel.update_yaxes(tickformat=".2%")
-        st.plotly_chart(fig_daily_channel, use_container_width=True)
+        if heatmap_metric == "alert_rate":
+            fig_heatmap.update_coloraxes(colorbar_tickformat=".2%")
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+    else:
+        st.info("No se pudo construir el heatmap por canal.")
+
+    st.markdown("### Peso relativo de cada canal en el tiempo")
+    info_box("Aquí no importa solo el volumen total, sino quién gana peso dentro del mix operativo diario.")
+
+    share_metric = "alerts" if "alerts" in daily_channel_filtered.columns else "transactions"
+    share_df = build_channel_share_over_time(daily_channel_filtered, share_metric)
+    if not share_df.empty:
+        fig_area = px.area(
+            share_df,
+            x="monitoring_date",
+            y="share",
+            color="channel",
+            title=f"Participación diaria por canal · {share_metric}",
+        )
+        fig_area.update_layout(
+            xaxis_title="Fecha",
+            yaxis_title="Participación",
+            yaxis_tickformat=".0%",
+            height=430,
+        )
+        st.plotly_chart(fig_area, use_container_width=True)
+    else:
+        st.info("No se pudo construir la evolución relativa por canal.")
 
 st.markdown("---")
 
@@ -1331,19 +1365,60 @@ st.markdown("---")
 # =========================================================
 
 st.markdown("## Análisis geográfico")
+info_box("Úsalo para separar países con mucho tráfico de países con una intensidad relativa de riesgo desproporcionada. El mapa es útil para detectar clusters regionales.")
 
-if country_summary_filtered.empty:
+if geo_metric_df.empty:
     st.info("No hay resumen geográfico disponible.")
 else:
-    geo1, geo2 = st.columns(2)
+    g1, g2 = st.columns(2)
 
-    top_country_alerts = country_summary_filtered.sort_values(
-        "alerts" if "alerts" in country_summary_filtered.columns else "transactions",
-        ascending=False,
-    ).head(15)
+    with g1:
+        choropleth_fig = px.choropleth(
+            geo_metric_df,
+            locations="iso_alpha",
+            color=geo_metric,
+            hover_name="country",
+            scope="europe",
+            title=f"Mapa de Europa · {geo_metric}",
+            color_continuous_scale="Viridis",
+            hover_data={
+                "transactions": ":,.0f",
+                "alerts": ":,.0f",
+                "alert_rate": ":.2%",
+                "importe_total": ":,.2f",
+                "iso_alpha": False,
+            },
+        )
+        choropleth_fig.update_layout(height=520, margin=dict(l=0, r=0, t=60, b=0))
+        st.plotly_chart(choropleth_fig, use_container_width=True)
 
-    with geo1:
-        if {"country", "alerts"}.issubset(top_country_alerts.columns):
+    with g2:
+        bubble_metric_size = "alerts" if "alerts" in geo_metric_df.columns else "transactions"
+        bubble_fig = px.scatter_geo(
+            geo_metric_df,
+            locations="iso_alpha",
+            hover_name="country",
+            size=bubble_metric_size,
+            color="alert_rate",
+            scope="europe",
+            title="Mapa burbuja · alertas y alert rate",
+            projection="natural earth",
+            hover_data={
+                "transactions": ":,.0f",
+                "alerts": ":,.0f",
+                "alert_rate": ":.2%",
+                "importe_total": ":,.2f",
+                "iso_alpha": False,
+            },
+        )
+        bubble_fig.update_layout(height=520, margin=dict(l=0, r=0, t=60, b=0))
+        st.plotly_chart(bubble_fig, use_container_width=True)
+
+    top_country_alerts = geo_metric_df.sort_values("alerts", ascending=False).head(15)
+    if not top_country_alerts.empty:
+        geo1, geo2 = st.columns(2)
+
+        with geo1:
             fig_country_alerts = px.bar(
                 top_country_alerts,
                 x="country",
@@ -1352,13 +1427,12 @@ else:
             )
             fig_country_alerts.update_layout(
                 xaxis_title="País",
-                yaxis_title="Nº alertas",
-                height=420,
+                yaxis_title="Alertas",
+                height=390,
             )
             st.plotly_chart(fig_country_alerts, use_container_width=True)
 
-    with geo2:
-        if {"country", "alert_rate"}.issubset(top_country_alerts.columns):
+        with geo2:
             fig_country_rate = px.bar(
                 top_country_alerts.sort_values("alert_rate", ascending=False),
                 x="country",
@@ -1369,15 +1443,11 @@ else:
                 xaxis_title="País",
                 yaxis_title="Alert rate",
                 yaxis_tickformat=".2%",
-                height=420,
+                height=390,
             )
             st.plotly_chart(fig_country_rate, use_container_width=True)
 
-    st.caption(
-        "Desde negocio, este bloque ayuda a separar países con mucho tráfico de países con una intensidad relativa de riesgo desproporcionada."
-    )
-
-    show_country_df = country_summary_filtered.copy()
+    show_country_df = geo_metric_df.copy()
     if "alert_rate" in show_country_df.columns:
         show_country_df["alert_rate"] = show_country_df["alert_rate"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
     st.dataframe(show_country_df.head(25), use_container_width=True, hide_index=True)
@@ -1390,6 +1460,7 @@ st.markdown("---")
 # =========================================================
 
 st.markdown("## Corte doméstico vs cross-border")
+info_box("Compara el comportamiento relativo de tráfico doméstico e internacional. Es útil para decidir si conviene aplicar reglas más exigentes en transacciones transfronterizas.")
 
 if cross_border_summary_filtered.empty:
     st.info("No se encontró una columna de cross-border en el dataset scored.")
@@ -1406,8 +1477,8 @@ else:
             )
             fig_cb_alerts.update_layout(
                 xaxis_title="Grupo",
-                yaxis_title="Nº alertas",
-                height=380,
+                yaxis_title="Alertas",
+                height=360,
             )
             st.plotly_chart(fig_cb_alerts, use_container_width=True)
 
@@ -1423,22 +1494,26 @@ else:
                 xaxis_title="Grupo",
                 yaxis_title="Alert rate",
                 yaxis_tickformat=".2%",
-                height=380,
+                height=360,
             )
             st.plotly_chart(fig_cb_rate, use_container_width=True)
 
-    st.dataframe(cross_border_summary_filtered, use_container_width=True, hide_index=True)
+    show_cross_df = cross_border_summary_filtered.copy()
+    if "alert_rate" in show_cross_df.columns:
+        show_cross_df["alert_rate"] = show_cross_df["alert_rate"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
+    st.dataframe(show_cross_df, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 
 # =========================================================
-# SCORE & EXPOSURE
+# MODELED RISK & ECONOMIC EXPOSURE
 # =========================================================
 
 st.markdown("## Riesgo modelizado y exposición económica")
+info_box("Este bloque traduce el output del modelo a decisiones de negocio: dónde está el score alto, dónde se acumulan las alertas y en qué buckets se concentra más importe.")
 
-score_distribution_df = build_score_distribution(scored_filtered, scored_meta["score_col"], bins=20)
+score_distribution_df = build_score_distribution(scored_filtered, scored_meta["score_col"], bins=25)
 amount_by_bucket_df = build_amount_by_bucket(scored_filtered, scored_meta["risk_bucket_col"], scored_meta["amount_col"])
 
 r1, r2 = st.columns(2)
@@ -1451,6 +1526,12 @@ with r1:
             y="transactions",
             title="Distribución del score de fraude",
         )
+        fig_score_dist.add_vline(
+            x=champion_threshold if champion_threshold is not None else 0.8987,
+            line_dash="dash",
+            annotation_text="Threshold",
+            annotation_position="top left",
+        )
         fig_score_dist.update_layout(
             xaxis_title="Intervalo de score",
             yaxis_title="Transacciones",
@@ -1462,33 +1543,79 @@ with r1:
 
 with r2:
     if not amount_by_bucket_df.empty:
-        fig_amount_bucket = px.bar(
+        fig_amount_bucket = px.treemap(
             amount_by_bucket_df,
-            x="bucket_riesgo",
-            y="importe_total",
-            title="Importe total por bucket de riesgo",
+            path=["bucket_riesgo"],
+            values="importe_total",
+            title="Treemap de exposición por bucket",
         )
-        fig_amount_bucket.update_layout(
-            xaxis_title="Bucket de riesgo",
-            yaxis_title="Importe total",
-            height=420,
-        )
+        fig_amount_bucket.update_layout(height=420)
         st.plotly_chart(fig_amount_bucket, use_container_width=True)
     else:
         st.info("No se pudo construir el análisis de importe por bucket.")
 
-st.caption(
-    "Este bloque responde a dos preguntas distintas: cómo se reparte el riesgo del modelo y dónde se concentra el importe económico potencialmente expuesto."
-)
+if not risk_bucket_summary_df.empty:
+    rb1, rb2 = st.columns(2)
+
+    with rb1:
+        if {"bucket_riesgo", "alerts", "alert_rate"}.issubset(risk_bucket_summary_df.columns):
+            fig_bucket_alert_rate = px.bar(
+                risk_bucket_summary_df,
+                x="bucket_riesgo",
+                y="alert_rate",
+                hover_data={"alerts": ":,.0f", "transactions": ":,.0f"},
+                title="Alert rate por bucket de riesgo",
+            )
+            fig_bucket_alert_rate.update_layout(
+                xaxis_title="Bucket",
+                yaxis_title="Alert rate",
+                yaxis_tickformat=".2%",
+                height=390,
+            )
+            st.plotly_chart(fig_bucket_alert_rate, use_container_width=True)
+
+    with rb2:
+        if {"bucket_riesgo", "score_medio", "alert_rate", "importe_total"}.issubset(risk_bucket_summary_df.columns):
+            fig_bucket_bubble = px.scatter(
+                risk_bucket_summary_df,
+                x="score_medio",
+                y="alert_rate",
+                size="importe_total",
+                color="bucket_riesgo",
+                hover_name="bucket_riesgo",
+                hover_data={
+                    "transactions": ":,.0f",
+                    "alerts": ":,.0f",
+                    "importe_total": ":,.2f",
+                    "score_medio": ":.4f",
+                    "alert_rate": ":.2%",
+                },
+                title="Buckets: score medio vs alert rate vs exposición",
+            )
+            fig_bucket_bubble.update_layout(
+                xaxis_title="Score medio",
+                yaxis_title="Alert rate",
+                yaxis_tickformat=".2%",
+                height=390,
+            )
+            st.plotly_chart(fig_bucket_bubble, use_container_width=True)
+
+    show_risk_df = risk_bucket_summary_df.copy()
+    if "alert_rate" in show_risk_df.columns:
+        show_risk_df["alert_rate"] = show_risk_df["alert_rate"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
+    if "score_medio" in show_risk_df.columns:
+        show_risk_df["score_medio"] = show_risk_df["score_medio"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+    st.dataframe(show_risk_df, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 
 # =========================================================
-# PAYMENT TYPE & MERCHANT CATEGORY
+# BUSINESS PATTERNS
 # =========================================================
 
 st.markdown("## Patrones de negocio")
+info_box("Aquí se localizan medios de pago y categorías de comercio donde conviene reforzar reglas, controles o revisión manual.")
 
 payment_alerts_df = build_payment_type_alerts(alert_filtered, scored_meta["payment_type_col"])
 merchant_category_alerts_df = build_merchant_category_alerts(alert_filtered, scored_meta["merchant_category_col"], top_n=15)
@@ -1506,7 +1633,7 @@ with p1:
         fig_payment.update_layout(
             xaxis_title="Tipo de pago",
             yaxis_title="Alertas",
-            height=420,
+            height=400,
         )
         st.plotly_chart(fig_payment, use_container_width=True)
     else:
@@ -1523,15 +1650,11 @@ with p2:
         fig_merchant_cat.update_layout(
             xaxis_title="Categoría de comercio",
             yaxis_title="Alertas",
-            height=420,
+            height=400,
         )
         st.plotly_chart(fig_merchant_cat, use_container_width=True)
     else:
         st.info("No se encontró una columna robusta de categoría de comercio.")
-
-st.caption(
-    "Este análisis ayuda a negocio a identificar combinaciones de producto, medio de pago y tipo de comercio donde conviene reforzar reglas, controles o revisión manual."
-)
 
 st.markdown("---")
 
@@ -1541,6 +1664,7 @@ st.markdown("---")
 # =========================================================
 
 st.markdown("## Micro-patrones temporales")
+info_box("Sirve para detectar franjas horarias y días de semana donde se acumula más actividad sospechosa y donde podrían tener sentido reglas temporales específicas.")
 
 weekday_alerts_df = build_weekday_alerts(alert_filtered, scored_meta["date_col"])
 hourly_alerts_df = build_hourly_alerts(alert_filtered, scored_meta["date_col"])
@@ -1558,7 +1682,7 @@ with m1:
         fig_weekday.update_layout(
             xaxis_title="Día de la semana",
             yaxis_title="Alertas",
-            height=420,
+            height=390,
         )
         st.plotly_chart(fig_weekday, use_container_width=True)
     else:
@@ -1576,15 +1700,11 @@ with m2:
         fig_hour.update_layout(
             xaxis_title="Hora",
             yaxis_title="Alertas",
-            height=420,
+            height=390,
         )
         st.plotly_chart(fig_hour, use_container_width=True)
     else:
         st.info("No fue posible construir el patrón horario.")
-
-st.caption(
-    "Estos patrones pueden señalar franjas de riesgo operativo, ventanas horarias anómalas o comportamientos transaccionales que justifican reglas temporales específicas."
-)
 
 st.markdown("---")
 
