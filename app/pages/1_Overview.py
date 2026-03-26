@@ -43,28 +43,27 @@ def get_data():
     )
 
 
+def format_metric_value(value, fmt: str = ".4f", pct: bool = False) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    if pct:
+        return f"{value:.2%}"
+    return format(float(value), fmt)
+
+
 data = get_data()
 
-scored_df = data["dashboard_scored_transactions"]
-executive_kpis_df = data["executive_kpis"]
-alert_queue_df = data["alert_queue"]
-q1_df = data["review_queue_top_1pct"]
-q3_df = data["review_queue_top_3pct"]
-q5_df = data["review_queue_top_5pct"]
-q10_df = data["review_queue_top_10pct"]
-queue_summary_df = data["queue_summary"]
-output_inventory_df = data["output_inventory"]
+scored_df = data.get("dashboard_scored_transactions", pd.DataFrame())
+executive_kpis_df = data.get("executive_kpis", pd.DataFrame())
+alert_queue_df = data.get("alert_queue", pd.DataFrame())
+q1_df = data.get("review_queue_top_1pct", pd.DataFrame())
+q3_df = data.get("review_queue_top_3pct", pd.DataFrame())
+q5_df = data.get("review_queue_top_5pct", pd.DataFrame())
+q10_df = data.get("review_queue_top_10pct", pd.DataFrame())
+queue_summary_df = data.get("queue_summary", pd.DataFrame())
+output_inventory_df = data.get("output_inventory", pd.DataFrame())
 
 inventory_df = list_expected_files()
-
-
-def first_existing_col(df: pd.DataFrame, candidates: list[str]):
-    lower_map = {str(c).lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    return None
-
 
 st.title("📊 Overview")
 st.caption("Executive entry point for the SentinelFlow fraud monitoring dashboard")
@@ -73,12 +72,12 @@ st.caption("Executive entry point for the SentinelFlow fraud monitoring dashboar
 # KPI BLOCK
 # =========================================================
 
-total_transactions = len(scored_df) if scored_df is not None and not scored_df.empty else None
-total_alerts = len(alert_queue_df) if alert_queue_df is not None and not alert_queue_df.empty else None
-q1_n = len(q1_df) if q1_df is not None and not q1_df.empty else None
-q3_n = len(q3_df) if q3_df is not None and not q3_df.empty else None
-q5_n = len(q5_df) if q5_df is not None and not q5_df.empty else None
-q10_n = len(q10_df) if q10_df is not None and not q10_df.empty else None
+total_transactions = len(scored_df) if not scored_df.empty else None
+total_alerts = len(alert_queue_df) if not alert_queue_df.empty else None
+q1_n = len(q1_df) if not q1_df.empty else None
+q3_n = len(q3_df) if not q3_df.empty else None
+q5_n = len(q5_df) if not q5_df.empty else None
+q10_n = len(q10_df) if not q10_df.empty else None
 
 champion_threshold = extract_kpi_value(
     executive_kpis_df,
@@ -130,19 +129,19 @@ with k1:
 with k2:
     st.metric("Alert queue", f"{total_alerts:,}" if total_alerts is not None else "N/A")
 with k3:
-    st.metric("Champion threshold", f"{champion_threshold:.4f}" if champion_threshold is not None else "N/A")
+    st.metric("Champion threshold", format_metric_value(champion_threshold))
 with k4:
-    st.metric("Test ROC-AUC", f"{roc_auc:.4f}" if roc_auc is not None else "N/A")
+    st.metric("Test ROC-AUC", format_metric_value(roc_auc))
 
 k5, k6, k7, k8 = st.columns(4)
 with k5:
-    st.metric("Test PR-AUC", f"{pr_auc:.4f}" if pr_auc is not None else "N/A")
+    st.metric("Test PR-AUC", format_metric_value(pr_auc))
 with k6:
-    st.metric("Precision", f"{precision:.4f}" if precision is not None else "N/A")
+    st.metric("Precision", format_metric_value(precision))
 with k7:
-    st.metric("Recall", f"{recall:.4f}" if recall is not None else "N/A")
+    st.metric("Recall", format_metric_value(recall))
 with k8:
-    st.metric("Top 3% recall", f"{top3_recall:.4f}" if top3_recall is not None else "N/A")
+    st.metric("Top 3% recall", format_metric_value(top3_recall, pct=True))
 
 st.markdown("---")
 
@@ -201,16 +200,86 @@ st.markdown("---")
 
 st.markdown("## Core dataset preview")
 
-if scored_df is not None and not scored_df.empty:
+if not scored_df.empty:
     preview_df = scored_df.copy()
     date_col = infer_main_transaction_date_column(preview_df)
     if date_col is not None:
         preview_df = parse_datetime_column(preview_df, date_col)
-    st.dataframe(preview_df.head(25), use_container_width=True, hide_index=True)
+
+    preview_cols = [
+        col for col in [
+            "transaction_id",
+            "transaction_ts",
+            "transaction_date",
+            "fraud_score",
+            "risk_bucket",
+            "alert_flag",
+            "prediction_outcome",
+            "review_rank",
+            "amount",
+            "channel",
+            "payment_type",
+            "merchant_category",
+            "customer_segment",
+            "transaction_country",
+            "ip_country",
+        ]
+        if col in preview_df.columns
+    ]
+
+    if preview_cols:
+        st.dataframe(
+            preview_df.loc[:, preview_cols].head(25),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.dataframe(preview_df.head(25), use_container_width=True, hide_index=True)
 else:
     st.warning("dashboard_scored_transactions.csv is missing or empty.")
     st.markdown("### File inventory diagnostic")
     st.dataframe(inventory_df, use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+# =========================================================
+# TEMPORARY DIAGNOSTICS
+# =========================================================
+
+with st.expander("Temporary diagnostics · Overview dataset loader", expanded=False):
+    st.markdown("### dashboard_scored_transactions diagnostics")
+
+    if not scored_df.empty:
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.metric("Rows", f"{scored_df.shape[0]:,}")
+        with d2:
+            st.metric("Columns", f"{scored_df.shape[1]:,}")
+        with d3:
+            detected_date_col = infer_main_transaction_date_column(scored_df)
+            st.metric("Detected date column", detected_date_col if detected_date_col else "None")
+
+        st.markdown("**Detected columns**")
+        st.write(list(scored_df.columns))
+
+        st.markdown("**First 5 rows**")
+        st.dataframe(scored_df.head(5), use_container_width=True, hide_index=True)
+    else:
+        st.error("dashboard_scored_transactions loaded as empty DataFrame.")
+        st.dataframe(inventory_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### Other dataset status")
+    diagnostic_rows = []
+    for dataset_name, df in data.items():
+        diagnostic_rows.append(
+            {
+                "dataset": dataset_name,
+                "rows": int(df.shape[0]) if isinstance(df, pd.DataFrame) else None,
+                "columns": int(df.shape[1]) if isinstance(df, pd.DataFrame) else None,
+                "empty": bool(df.empty) if isinstance(df, pd.DataFrame) else True,
+            }
+        )
+    st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
@@ -225,10 +294,3 @@ if output_inventory_df is not None and not output_inventory_df.empty:
 else:
     st.info("output_inventory.csv is missing or empty. Falling back to filesystem inventory.")
     st.dataframe(inventory_df, use_container_width=True, hide_index=True)
-
-st.markdown("---")
-st.markdown(
-    """
-    **Next build recommendation:** continue with **Alert Queue** as the next operational page.
-    """
-)
