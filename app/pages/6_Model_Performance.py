@@ -2,21 +2,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import (
-    auc,
-    average_precision_score,
-    confusion_matrix,
-    precision_recall_curve,
-    roc_auc_score,
-    roc_curve,
-)
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -47,10 +39,6 @@ def _safe_read_csv(path: Path) -> Optional[pd.DataFrame]:
 
 @st.cache_data(show_spinner=False)
 def load_dashboard_data() -> pd.DataFrame:
-    """
-    Intenta cargar primero el dataset principal desde artifacts/dashboard_exports.
-    Si no lo encuentra, busca un CSV razonable con score / label.
-    """
     exports_dir = ROOT / "artifacts" / "dashboard_exports"
 
     preferred_files = [
@@ -61,18 +49,17 @@ def load_dashboard_data() -> pd.DataFrame:
         "alerts_dashboard.csv",
     ]
 
-    # 1) intento preferente
     for fname in preferred_files:
         df = _safe_read_csv(exports_dir / fname)
         if df is not None and not df.empty:
             return df
 
-    # 2) fallback: buscar csv con columnas parecidas a score/label
     if exports_dir.exists():
         for csv_path in sorted(exports_dir.glob("*.csv")):
             df = _safe_read_csv(csv_path)
             if df is None or df.empty:
                 continue
+
             cols = [c.lower() for c in df.columns]
             has_score = any(
                 x in cols
@@ -215,8 +202,7 @@ def infer_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
 def coerce_binary_label(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         out = pd.to_numeric(series, errors="coerce").fillna(0)
-        out = (out > 0).astype(int)
-        return out
+        return (out > 0).astype(int)
 
     s = series.astype(str).str.strip().str.lower()
     mapping_true = {"1", "true", "yes", "y", "fraud", "positive", "positivo", "si", "sí"}
@@ -230,14 +216,11 @@ def coerce_score(series: pd.Series) -> pd.Series:
     if s.notna().sum() == 0:
         return s
 
-    # si parece porcentaje 0-100, convertir a 0-1
     q99 = s.quantile(0.99)
-    if q99 is not None and pd.notna(q99) and q99 > 1.5 and q99 <= 100:
+    if pd.notna(q99) and q99 > 1.5 and q99 <= 100:
         s = s / 100.0
 
-    # acotar
-    s = s.clip(lower=0, upper=1)
-    return s
+    return s.clip(lower=0, upper=1)
 
 
 def derive_prediction_from_score(score: pd.Series, threshold: float) -> pd.Series:
@@ -300,8 +283,20 @@ def format_num(x: Optional[float]) -> str:
 
 
 # =========================================================
-# METRICS
+# METRICS WITHOUT SKLEARN
 # =========================================================
+def confusion_counts(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, int]:
+    y_true = y_true.astype(int).to_numpy()
+    y_pred = y_pred.astype(int).to_numpy()
+
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+
+    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn}
+
+
 def compute_confusion_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, float]:
     if len(y_true) == 0:
         return {
@@ -317,7 +312,8 @@ def compute_confusion_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str,
             "fn": 0,
         }
 
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    c = confusion_counts(y_true, y_pred)
+    tp, fp, tn, fn = c["tp"], c["fp"], c["tn"], c["fn"]
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else np.nan
     recall = tp / (tp + fn) if (tp + fn) > 0 else np.nan
@@ -328,7 +324,6 @@ def compute_confusion_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str,
     )
     fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
     alert_rate = (tp + fp) / len(y_true) if len(y_true) > 0 else np.nan
-    fraud_capture_rate = recall
 
     return {
         "precision": precision,
@@ -336,7 +331,7 @@ def compute_confusion_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str,
         "f1": f1,
         "fpr": fpr,
         "alert_rate": alert_rate,
-        "fraud_capture_rate": fraud_capture_rate,
+        "fraud_capture_rate": recall,
         "tp": tp,
         "fp": fp,
         "tn": tn,
@@ -344,19 +339,104 @@ def compute_confusion_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str,
     }
 
 
+def _prepare_binary_arrays(y_true: pd.Series, score: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    valid = ~(y_true.isna() | score.isna())
+    y = y_true[valid].astype(int).to_numpy()
+    s = score[valid].astype(float).to_numpy()
+    return y, s
+
+
+def roc_curve_manual(y_true: pd.Series, score: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y, s = _prepare_binary_arrays(y_true, score)
+
+    if len(y) == 0 or np.unique(y).size < 2:
+        return np.array([]), np.array([]), np.array([])
+
+    thresholds = np.unique(s)[::-1]
+    thresholds = np.r_[np.inf, thresholds, -np.inf]
+
+    tpr_list = []
+    fpr_list = []
+
+    pos = (y == 1).sum()
+    neg = (y == 0).sum()
+
+    for thr in thresholds:
+        pred = (s >= thr).astype(int)
+        c = confusion_counts(pd.Series(y), pd.Series(pred))
+        tpr = c["tp"] / pos if pos > 0 else np.nan
+        fpr = c["fp"] / neg if neg > 0 else np.nan
+        tpr_list.append(tpr)
+        fpr_list.append(fpr)
+
+    return np.array(fpr_list), np.array(tpr_list), thresholds
+
+
+def precision_recall_curve_manual(y_true: pd.Series, score: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y, s = _prepare_binary_arrays(y_true, score)
+
+    if len(y) == 0 or np.unique(y).size < 2:
+        return np.array([]), np.array([]), np.array([])
+
+    thresholds = np.unique(s)[::-1]
+
+    precision_list = []
+    recall_list = []
+
+    pos = (y == 1).sum()
+
+    for thr in thresholds:
+        pred = (s >= thr).astype(int)
+        c = confusion_counts(pd.Series(y), pd.Series(pred))
+        precision = c["tp"] / (c["tp"] + c["fp"]) if (c["tp"] + c["fp"]) > 0 else 1.0
+        recall = c["tp"] / pos if pos > 0 else np.nan
+        precision_list.append(precision)
+        recall_list.append(recall)
+
+    precision_arr = np.array(precision_list)
+    recall_arr = np.array(recall_list)
+
+    order = np.argsort(recall_arr)
+    return precision_arr[order], recall_arr[order], thresholds
+
+
+def auc_trapezoid(x: np.ndarray, y: np.ndarray) -> float:
+    if len(x) < 2 or len(y) < 2:
+        return np.nan
+    valid = ~(np.isnan(x) | np.isnan(y))
+    x = x[valid]
+    y = y[valid]
+    if len(x) < 2:
+        return np.nan
+    return float(np.trapz(y, x))
+
+
+def roc_auc_manual(y_true: pd.Series, score: pd.Series) -> float:
+    fpr, tpr, _ = roc_curve_manual(y_true, score)
+    return auc_trapezoid(fpr, tpr)
+
+
+def pr_auc_manual(y_true: pd.Series, score: pd.Series) -> float:
+    precision, recall, _ = precision_recall_curve_manual(y_true, score)
+    return auc_trapezoid(recall, precision)
+
+
 def compute_auc_metrics(y_true: pd.Series, score: pd.Series) -> Dict[str, float]:
     valid = ~(y_true.isna() | score.isna())
     y = y_true[valid]
     s = score[valid]
 
+    if len(y) == 0:
+        return {"roc_auc": np.nan, "pr_auc": np.nan, "base_rate": np.nan}
+
     if y.nunique() < 2:
-        return {"roc_auc": np.nan, "pr_auc": np.nan, "base_rate": y.mean() if len(y) else np.nan}
+        return {"roc_auc": np.nan, "pr_auc": np.nan, "base_rate": y.mean()}
 
-    roc_auc = roc_auc_score(y, s)
-    pr_auc = average_precision_score(y, s)
-    base_rate = y.mean()
-
-    return {"roc_auc": roc_auc, "pr_auc": pr_auc, "base_rate": base_rate}
+    return {
+        "roc_auc": roc_auc_manual(y, s),
+        "pr_auc": pr_auc_manual(y, s),
+        "base_rate": y.mean(),
+    }
 
 
 def build_threshold_table(
@@ -496,6 +576,7 @@ def build_segment_performance(
     for seg, g in tmp.groupby(segment_col):
         if len(g) < min_rows:
             continue
+
         y = g[label_col].astype(int)
         s = g[score_col].astype(float)
         pred = (s >= threshold).astype(int)
@@ -619,7 +700,6 @@ def plot_fraud_by_decile(df: pd.DataFrame, label_col: str, score_col: str) -> go
         .reset_index()
     )
 
-    # ordenar D10 arriba si procede
     order_map = {f"D{i}": i for i in range(1, 11)}
     dec["sort_key"] = dec["score_decile"].astype(str).map(order_map)
     dec = dec.sort_values("sort_key", ascending=False)
@@ -637,17 +717,14 @@ def plot_fraud_by_decile(df: pd.DataFrame, label_col: str, score_col: str) -> go
 
 
 def plot_roc_curve(y_true: pd.Series, score: pd.Series) -> go.Figure:
-    valid = ~(y_true.isna() | score.isna())
-    y = y_true[valid]
-    s = score[valid]
+    fpr, tpr, _ = roc_curve_manual(y_true, score)
 
     fig = go.Figure()
-    if len(y) == 0 or y.nunique() < 2:
+    if len(fpr) == 0 or len(tpr) == 0:
         fig.update_layout(title="Curva ROC no disponible")
         return fig
 
-    fpr, tpr, _ = roc_curve(y, s)
-    auc_value = roc_auc_score(y, s)
+    auc_value = auc_trapezoid(fpr, tpr)
 
     fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"Modelo (AUC={auc_value:.3f})"))
     fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Azar", line=dict(dash="dash")))
@@ -663,29 +740,27 @@ def plot_roc_curve(y_true: pd.Series, score: pd.Series) -> go.Figure:
 
 
 def plot_pr_curve(y_true: pd.Series, score: pd.Series) -> go.Figure:
-    valid = ~(y_true.isna() | score.isna())
-    y = y_true[valid]
-    s = score[valid]
+    precision, recall, _ = precision_recall_curve_manual(y_true, score)
 
     fig = go.Figure()
-    if len(y) == 0 or y.nunique() < 2:
+    if len(precision) == 0 or len(recall) == 0:
         fig.update_layout(title="Curva Precision-Recall no disponible")
         return fig
 
-    precision, recall, _ = precision_recall_curve(y, s)
-    pr_auc = auc(recall, precision)
-    base_rate = y.mean()
+    base_rate = y_true.mean() if len(y_true) > 0 else np.nan
+    pr_auc = auc_trapezoid(recall, precision)
 
     fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name=f"Modelo (AUC={pr_auc:.3f})"))
-    fig.add_trace(
-        go.Scatter(
-            x=[0, 1],
-            y=[base_rate, base_rate],
-            mode="lines",
-            name="Base rate",
-            line=dict(dash="dash"),
+    if pd.notna(base_rate):
+        fig.add_trace(
+            go.Scatter(
+                x=[0, 1],
+                y=[base_rate, base_rate],
+                mode="lines",
+                name="Base rate",
+                line=dict(dash="dash"),
+            )
         )
-    )
 
     fig.update_layout(
         title="Curva Precision-Recall",
@@ -893,12 +968,8 @@ if schema["risk_bucket"] is None:
 else:
     risk_bucket_col = schema["risk_bucket"]
 
-# =========================================================
-# SIDEBAR FILTERS
-# =========================================================
 st.sidebar.header("Filtros")
 
-# rango temporal
 if df["__timestamp__"].notna().sum() > 0:
     min_date = df["__timestamp__"].min().date()
     max_date = df["__timestamp__"].max().date()
@@ -915,7 +986,6 @@ if df["__timestamp__"].notna().sum() > 0:
             & (df["__timestamp__"].dt.date <= end_date)
         ].copy()
 
-# canal
 if schema["channel"] is not None:
     channel_values = sorted([x for x in df[schema["channel"]].dropna().astype(str).unique()])
     selected_channels = st.sidebar.multiselect(
@@ -926,7 +996,6 @@ if schema["channel"] is not None:
     if selected_channels:
         df = df[df[schema["channel"]].astype(str).isin(selected_channels)].copy()
 
-# país
 if schema["country"] is not None:
     country_values = sorted([x for x in df[schema["country"]].dropna().astype(str).unique()])
     selected_countries = st.sidebar.multiselect(
@@ -937,17 +1006,14 @@ if schema["country"] is not None:
     if selected_countries:
         df = df[df[schema["country"]].astype(str).isin(selected_countries)].copy()
 
-# threshold
-default_threshold = 0.70
 threshold = st.sidebar.slider(
     "Threshold operativo",
     min_value=0.05,
     max_value=0.95,
-    value=float(default_threshold),
+    value=0.70,
     step=0.05,
 )
 
-# granularidad temporal
 freq_label = st.sidebar.selectbox(
     "Granularidad temporal",
     options=["Semanal", "Mensual"],
@@ -962,9 +1028,6 @@ if len(df) == 0:
     st.warning("No hay datos después de aplicar los filtros.")
     st.stop()
 
-# =========================================================
-# EXEC SUMMARY
-# =========================================================
 st.markdown("## 1) Resumen ejecutivo")
 info_box(
     "Este bloque resume si el modelo está aportando valor operativo: qué capacidad tiene para separar fraude de no fraude, "
@@ -1022,9 +1085,6 @@ with c11:
         "Cuánto fraude total se concentra en el 10% superior del score."
     )
 
-# =========================================================
-# SCORE QUALITY
-# =========================================================
 st.markdown("## 2) Calidad de separación del score")
 info_box(
     "Aquí se observa si el score realmente ordena bien el riesgo. "
@@ -1054,9 +1114,6 @@ with col_d:
         st.info("No fue posible calcular lift / concentración.")
     st.caption("Lectura rápida: ayuda a entender cuánto valor genera priorizar las alertas por score.")
 
-# =========================================================
-# CURVES AND THRESHOLD
-# =========================================================
 st.markdown("## 3) Curvas de rendimiento y trade-off operativo")
 info_box(
     "Este bloque ayuda a decidir dónde poner el threshold. "
@@ -1076,14 +1133,12 @@ threshold_df = build_threshold_table(df["__label__"], df["__score__"])
 st.plotly_chart(plot_threshold_tradeoff(threshold_df), use_container_width=True)
 st.caption("Lectura rápida: permite ver el equilibrio entre calidad de la alerta, captura y carga operativa.")
 
-# tabla de thresholds sugeridos
 st.markdown("### Thresholds sugeridos")
 if not threshold_df.empty:
     thr_show = threshold_df.copy()
     for col in ["alert_rate", "precision", "recall", "f1", "false_positive_rate", "fraud_capture_rate"]:
         thr_show[col] = thr_show[col].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
 
-    # sugerencias simples
     best_f1_row = threshold_df.loc[threshold_df["f1"].idxmax()] if threshold_df["f1"].notna().any() else None
     best_precision_row = threshold_df[threshold_df["alertas"] > 0].sort_values(["precision", "recall"], ascending=False).head(1)
     best_recall_row = threshold_df.sort_values(["recall", "precision"], ascending=False).head(1)
@@ -1125,9 +1180,6 @@ if not threshold_df.empty:
         hide_index=True,
     )
 
-# =========================================================
-# TEMPORAL PERFORMANCE
-# =========================================================
 st.markdown("## 4) Rendimiento y estabilidad en el tiempo")
 
 if df["__timestamp__"].notna().sum() > 0:
@@ -1163,9 +1215,6 @@ else:
     temporal_df = pd.DataFrame()
     st.info("No se detectó una columna temporal utilizable para análisis de estabilidad.")
 
-# =========================================================
-# SEGMENT COMPARISON
-# =========================================================
 st.markdown("## 5) Comparación segmentada")
 info_box(
     "Este bloque ayuda a ver si el modelo funciona igual de bien en todos los contextos. "
@@ -1204,20 +1253,17 @@ if seg_cols_to_try:
                 st.caption(f"Lectura rápida: permite detectar dónde el modelo captura mejor el fraude en {tab_name.lower()}.")
 
                 show_seg = seg_perf.copy()
-                for col in ["fraud_rate_real", "score_medio", "roc_auc", "precision", "recall", "f1", "alert_rate", "fraud_capture_rate"]:
-                    show_seg[col] = show_seg[col].map(lambda x: f"{x:.1%}" if col not in ["roc_auc"] and pd.notna(x) else (f"{x:.3f}" if pd.notna(x) else "N/A"))
+                for col in ["fraud_rate_real", "score_medio", "precision", "recall", "f1", "alert_rate", "fraud_capture_rate"]:
+                    show_seg[col] = show_seg[col].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                show_seg["roc_auc"] = show_seg["roc_auc"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/A")
                 st.dataframe(show_seg, use_container_width=True, hide_index=True)
 else:
     st.info("No se detectaron columnas segmentables como canal, país o risk bucket.")
 
-# =========================================================
-# DETERIORATION SIGNALS
-# =========================================================
 st.markdown("## 6) Señales de deterioro o monitorización de estabilidad")
 
 segment_for_signals = None
 if segment_tables:
-    # usar la primera tabla no vacía
     for _, seg_df in segment_tables:
         if seg_df is not None and not seg_df.empty:
             segment_for_signals = seg_df
@@ -1228,9 +1274,6 @@ signals = detect_deterioration_signals(temporal_df, segment_for_signals)
 for s in signals:
     st.markdown(f"- {s}")
 
-# =========================================================
-# EXECUTIVE VS TECHNICAL READING
-# =========================================================
 st.markdown("## 7) Lectura ejecutiva y lectura técnica")
 
 exec_msg_parts = []
@@ -1266,9 +1309,6 @@ with col_j:
         + " Esta página debe leerse junto con Alert Queue y Review Capacity, porque cualquier cambio de threshold afecta directamente al volumen revisable y a la eficiencia del equipo."
     )
 
-# =========================================================
-# DATA DICTIONARY SNAPSHOT
-# =========================================================
 with st.expander("Ver columnas detectadas en el dataset"):
     detected = pd.DataFrame(
         {
