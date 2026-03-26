@@ -72,6 +72,8 @@ def load_dashboard_data() -> pd.DataFrame:
                     "model_score",
                     "risk_probability",
                     "prediction_score",
+                    "fraud_prob",
+                    "pred_proba",
                 ]
             )
             has_label = any(
@@ -83,6 +85,7 @@ def load_dashboard_data() -> pd.DataFrame:
                     "target",
                     "y_true",
                     "actual_fraud",
+                    "fraud_flag",
                 ]
             )
             if has_score and has_label:
@@ -235,7 +238,7 @@ def ensure_datetime(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
 
 def add_score_bands(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
     out = df.copy()
-    bins = [-0.001, 0.1, 0.2, 0.4, 0.6, 0.8, 0.9, 1.0]
+    bins = [-0.001, 0.10, 0.20, 0.40, 0.60, 0.80, 0.90, 1.00]
     labels = [
         "0.00–0.10",
         "0.10–0.20",
@@ -286,13 +289,13 @@ def format_num(x: Optional[float]) -> str:
 # METRICS WITHOUT SKLEARN
 # =========================================================
 def confusion_counts(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, int]:
-    y_true = y_true.astype(int).to_numpy()
-    y_pred = y_pred.astype(int).to_numpy()
+    y_true_arr = y_true.astype(int).to_numpy()
+    y_pred_arr = y_pred.astype(int).to_numpy()
 
-    tp = int(((y_true == 1) & (y_pred == 1)).sum())
-    fp = int(((y_true == 0) & (y_pred == 1)).sum())
-    tn = int(((y_true == 0) & (y_pred == 0)).sum())
-    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    tp = int(((y_true_arr == 1) & (y_pred_arr == 1)).sum())
+    fp = int(((y_true_arr == 0) & (y_pred_arr == 1)).sum())
+    tn = int(((y_true_arr == 0) & (y_pred_arr == 0)).sum())
+    fn = int(((y_true_arr == 1) & (y_pred_arr == 0)).sum())
 
     return {"tp": tp, "fp": fp, "tn": tn, "fn": fn}
 
@@ -403,12 +406,22 @@ def precision_recall_curve_manual(y_true: pd.Series, score: pd.Series) -> tuple[
 def auc_trapezoid(x: np.ndarray, y: np.ndarray) -> float:
     if len(x) < 2 or len(y) < 2:
         return np.nan
+
     valid = ~(np.isnan(x) | np.isnan(y))
-    x = x[valid]
-    y = y[valid]
+    x = np.asarray(x[valid], dtype=float)
+    y = np.asarray(y[valid], dtype=float)
+
     if len(x) < 2:
         return np.nan
-    return float(np.trapz(y, x))
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    dx = np.diff(x)
+    avg_y = (y[:-1] + y[1:]) / 2.0
+
+    return float(np.sum(dx * avg_y))
 
 
 def roc_auc_manual(y_true: pd.Series, score: pd.Series) -> float:
@@ -599,6 +612,9 @@ def build_segment_performance(
             }
         )
 
+    if not rows:
+        return pd.DataFrame()
+
     return pd.DataFrame(rows).sort_values(["fraud_capture_rate", "precision"], ascending=False)
 
 
@@ -641,13 +657,10 @@ def detect_deterioration_signals(
         if len(low_perf) > 0:
             signals.append("Hay segmentos con AUC ROC bajo (<0.60): el modelo no separa bien en todas las poblaciones.")
 
-        spread_precision = (
-            segment_df["precision"].max() - segment_df["precision"].min()
-            if segment_df["precision"].notna().sum() >= 2
-            else np.nan
-        )
-        if pd.notna(spread_precision) and spread_precision > 0.20:
-            signals.append("Gran dispersión de precision entre segmentos: conviene revisar thresholds o tratamiento segmentado.")
+        if segment_df["precision"].notna().sum() >= 2:
+            spread_precision = segment_df["precision"].max() - segment_df["precision"].min()
+            if pd.notna(spread_precision) and spread_precision > 0.20:
+                signals.append("Gran dispersión de precision entre segmentos: conviene revisar thresholds o tratamiento segmentado.")
 
     if not signals:
         signals.append("No se observan señales fuertes de deterioro con los indicadores disponibles en esta muestra.")
@@ -747,7 +760,8 @@ def plot_pr_curve(y_true: pd.Series, score: pd.Series) -> go.Figure:
         fig.update_layout(title="Curva Precision-Recall no disponible")
         return fig
 
-    base_rate = y_true.mean() if len(y_true) > 0 else np.nan
+    valid = ~(y_true.isna() | score.isna())
+    base_rate = y_true[valid].mean() if valid.sum() > 0 else np.nan
     pr_auc = auc_trapezoid(recall, precision)
 
     fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name=f"Modelo (AUC={pr_auc:.3f})"))
@@ -937,17 +951,13 @@ st.title("Model Performance")
 st.caption("Seguimiento operativo del rendimiento del modelo champion de fraude en producción.")
 
 if df_raw.empty:
-    st.error(
-        "No se encontró un dataset válido en artifacts/dashboard_exports/ con columnas de score y label."
-    )
+    st.error("No se encontró un dataset válido en artifacts/dashboard_exports/ con columnas de score y label.")
     st.stop()
 
 schema = infer_columns(df_raw)
 
 if schema["label"] is None or schema["score"] is None:
-    st.error(
-        "El dataset cargado no contiene las columnas mínimas necesarias para esta página: label y score."
-    )
+    st.error("El dataset cargado no contiene las columnas mínimas necesarias para esta página: label y score.")
     st.write("Columnas detectadas:", list(df_raw.columns))
     st.stop()
 
@@ -968,6 +978,9 @@ if schema["risk_bucket"] is None:
 else:
     risk_bucket_col = schema["risk_bucket"]
 
+# =========================================================
+# SIDEBAR FILTERS
+# =========================================================
 st.sidebar.header("Filtros")
 
 if df["__timestamp__"].notna().sum() > 0:
@@ -1028,6 +1041,9 @@ if len(df) == 0:
     st.warning("No hay datos después de aplicar los filtros.")
     st.stop()
 
+# =========================================================
+# 1) RESUMEN EJECUTIVO
+# =========================================================
 st.markdown("## 1) Resumen ejecutivo")
 info_box(
     "Este bloque resume si el modelo está aportando valor operativo: qué capacidad tiene para separar fraude de no fraude, "
@@ -1044,47 +1060,80 @@ captured_fraud = int(((df["__pred__"] == 1) & (df["__label__"] == 1)).sum())
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    metric_card("AUC ROC", f"{auc_metrics['roc_auc']:.3f}" if pd.notna(auc_metrics["roc_auc"]) else "N/A",
-                "Capacidad global de discriminación del score.")
+    metric_card(
+        "AUC ROC",
+        f"{auc_metrics['roc_auc']:.3f}" if pd.notna(auc_metrics["roc_auc"]) else "N/A",
+        "Capacidad global de discriminación del score.",
+    )
 with c2:
-    metric_card("Precision", format_pct(conf_metrics["precision"]),
-                "De las alertas generadas, qué proporción termina siendo fraude real.")
+    metric_card(
+        "Precision",
+        format_pct(conf_metrics["precision"]),
+        "De las alertas generadas, qué proporción termina siendo fraude real.",
+    )
 with c3:
-    metric_card("Recall", format_pct(conf_metrics["recall"]),
-                "Del fraude real observado, qué proporción consigue capturar el modelo.")
+    metric_card(
+        "Recall",
+        format_pct(conf_metrics["recall"]),
+        "Del fraude real observado, qué proporción consigue capturar el modelo.",
+    )
 with c4:
-    metric_card("F1", f"{conf_metrics['f1']:.3f}" if pd.notna(conf_metrics["f1"]) else "N/A",
-                "Equilibrio entre precision y recall.")
+    metric_card(
+        "F1",
+        f"{conf_metrics['f1']:.3f}" if pd.notna(conf_metrics["f1"]) else "N/A",
+        "Equilibrio entre precision y recall.",
+    )
 
 c5, c6, c7, c8 = st.columns(4)
 with c5:
-    metric_card("Fraud Capture Rate", format_pct(conf_metrics["fraud_capture_rate"]),
-                "Equivale al recall en esta vista operativa.")
+    metric_card(
+        "Fraud Capture Rate",
+        format_pct(conf_metrics["fraud_capture_rate"]),
+        "Equivale al recall en esta vista operativa.",
+    )
 with c6:
-    metric_card("False Positive Rate", format_pct(conf_metrics["fpr"]),
-                "Parte del no fraude que está entrando como alerta.")
+    metric_card(
+        "False Positive Rate",
+        format_pct(conf_metrics["fpr"]),
+        "Parte del no fraude que está entrando como alerta.",
+    )
 with c7:
-    metric_card("Alert Rate", format_pct(conf_metrics["alert_rate"]),
-                "Porcentaje del tráfico total que se envía a revisión.")
+    metric_card(
+        "Alert Rate",
+        format_pct(conf_metrics["alert_rate"]),
+        "Porcentaje del tráfico total que se envía a revisión.",
+    )
 with c8:
-    metric_card("Fraudes capturados", f"{captured_fraud:,} / {total_fraud:,}",
-                "Fraude real recuperado al threshold seleccionado.")
+    metric_card(
+        "Fraudes capturados",
+        f"{captured_fraud:,} / {total_fraud:,}",
+        "Fraude real recuperado al threshold seleccionado.",
+    )
 
 c9, c10, c11 = st.columns(3)
 with c9:
-    metric_card("Alertas generadas", format_num(total_alerts),
-                "Volumen operativo que impacta directamente en Alert Queue y Review Capacity.")
+    metric_card(
+        "Alertas generadas",
+        format_num(total_alerts),
+        "Volumen operativo que impacta directamente en Alert Queue y Review Capacity.",
+    )
 with c10:
-    metric_card("PR AUC", f"{auc_metrics['pr_auc']:.3f}" if pd.notna(auc_metrics["pr_auc"]) else "N/A",
-                "Más útil que ROC cuando el fraude es muy minoritario.")
+    metric_card(
+        "PR AUC",
+        f"{auc_metrics['pr_auc']:.3f}" if pd.notna(auc_metrics["pr_auc"]) else "N/A",
+        "Más útil que ROC cuando el fraude es muy minoritario.",
+    )
 with c11:
     top10_capture = lift_df.loc[lift_df["banda"] == "Top 10%", "fraud_capture_rate"]
     metric_card(
         "Fraude en Top 10%",
         format_pct(top10_capture.iloc[0]) if len(top10_capture) else "N/A",
-        "Cuánto fraude total se concentra en el 10% superior del score."
+        "Cuánto fraude total se concentra en el 10% superior del score.",
     )
 
+# =========================================================
+# 2) CALIDAD DE SEPARACIÓN
+# =========================================================
 st.markdown("## 2) Calidad de separación del score")
 info_box(
     "Aquí se observa si el score realmente ordena bien el riesgo. "
@@ -1114,6 +1163,9 @@ with col_d:
         st.info("No fue posible calcular lift / concentración.")
     st.caption("Lectura rápida: ayuda a entender cuánto valor genera priorizar las alertas por score.")
 
+# =========================================================
+# 3) CURVAS Y THRESHOLD
+# =========================================================
 st.markdown("## 3) Curvas de rendimiento y trade-off operativo")
 info_box(
     "Este bloque ayuda a decidir dónde poner el threshold. "
@@ -1180,6 +1232,9 @@ if not threshold_df.empty:
         hide_index=True,
     )
 
+# =========================================================
+# 4) TEMPORAL
+# =========================================================
 st.markdown("## 4) Rendimiento y estabilidad en el tiempo")
 
 if df["__timestamp__"].notna().sum() > 0:
@@ -1215,6 +1270,9 @@ else:
     temporal_df = pd.DataFrame()
     st.info("No se detectó una columna temporal utilizable para análisis de estabilidad.")
 
+# =========================================================
+# 5) SEGMENTACIÓN
+# =========================================================
 st.markdown("## 5) Comparación segmentada")
 info_box(
     "Este bloque ayuda a ver si el modelo funciona igual de bien en todos los contextos. "
@@ -1260,6 +1318,9 @@ if seg_cols_to_try:
 else:
     st.info("No se detectaron columnas segmentables como canal, país o risk bucket.")
 
+# =========================================================
+# 6) SEÑALES DE DETERIORO
+# =========================================================
 st.markdown("## 6) Señales de deterioro o monitorización de estabilidad")
 
 segment_for_signals = None
@@ -1274,6 +1335,9 @@ signals = detect_deterioration_signals(temporal_df, segment_for_signals)
 for s in signals:
     st.markdown(f"- {s}")
 
+# =========================================================
+# 7) LECTURA EJECUTIVA Y TÉCNICA
+# =========================================================
 st.markdown("## 7) Lectura ejecutiva y lectura técnica")
 
 exec_msg_parts = []
@@ -1309,6 +1373,9 @@ with col_j:
         + " Esta página debe leerse junto con Alert Queue y Review Capacity, porque cualquier cambio de threshold afecta directamente al volumen revisable y a la eficiencia del equipo."
     )
 
+# =========================================================
+# DEBUG / SCHEMA SNAPSHOT
+# =========================================================
 with st.expander("Ver columnas detectadas en el dataset"):
     detected = pd.DataFrame(
         {
