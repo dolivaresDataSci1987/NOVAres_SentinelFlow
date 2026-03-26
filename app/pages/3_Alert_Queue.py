@@ -23,7 +23,6 @@ st.set_page_config(
     layout="wide",
 )
 
-
 # =========================================================
 # DATA LOADING
 # =========================================================
@@ -77,7 +76,30 @@ def first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
+def unique_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
+def safe_string_fill(series: pd.Series, default: str = "Desconocido") -> pd.Series:
+    return series.replace(["nan", "None", "NaN", ""], np.nan).fillna(default).astype(str)
+
+
 def pick_alert_dataset(datasets: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, str]:
+    """
+    Intenta elegir el dataset más útil para una cola de alertas.
+    """
     if not datasets:
         return pd.DataFrame(), ""
 
@@ -105,18 +127,16 @@ def pick_alert_dataset(datasets: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame,
 
         ncols = [normalize_colname(c) for c in df.columns]
 
-        if any(c in ncols for c in ["risk_score", "fraud_probability", "model_score", "alert_score", "score"]):
-            score += 4
-        if any(c in ncols for c in ["transaction_amount", "amount", "amount_eur", "usd_amount"]):
-            score += 2
+        if any(c in ncols for c in ["risk_score", "fraud_probability", "model_score", "alert_score", "score", "fraud_score", "predicted_probability"]):
+            score += 5
+
+        if any(c in ncols for c in ["transaction_amount", "amount", "amount_eur", "usd_amount", "payment_amount", "tx_amount"]):
+            score += 3
+
         if any(c in ncols for c in ["transaction_id", "alert_id", "case_id"]):
             score += 2
 
         scored.append((score, name, df))
-
-    if not scored:
-        first_name = list(datasets.keys())[0]
-        return datasets[first_name].copy(), first_name
 
     scored.sort(key=lambda x: x[0], reverse=True)
     _, best_name, best_df = scored[0]
@@ -140,7 +160,7 @@ def coerce_datetime(df: pd.DataFrame, cols: List[Optional[str]]) -> pd.DataFrame
 
 
 def infer_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    schema = {
+    return {
         "id": first_existing(df, [
             "alert_id", "transaction_id", "case_id", "event_id", "id"
         ]),
@@ -191,26 +211,6 @@ def infer_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
             "alert_status", "status", "review_status", "case_status"
         ]),
     }
-    return schema
-
-
-def build_risk_bucket(df: pd.DataFrame, score_col: Optional[str]) -> pd.Series:
-    if score_col is None or score_col not in df.columns:
-        return pd.Series(["Sin score"] * len(df), index=df.index)
-
-    s = pd.to_numeric(df[score_col], errors="coerce")
-
-    if s.dropna().empty:
-        return pd.Series(["Sin score"] * len(df), index=df.index)
-
-    if s.max(skipna=True) <= 1.0:
-        bins = [-np.inf, 0.40, 0.70, 0.85, np.inf]
-        labels = ["Bajo", "Medio", "Alto", "Crítico"]
-    else:
-        bins = [-np.inf, 40, 70, 85, np.inf]
-        labels = ["Bajo", "Medio", "Alto", "Crítico"]
-
-    return pd.cut(s, bins=bins, labels=labels)
 
 
 def normalize_score_to_100(series: pd.Series) -> pd.Series:
@@ -220,6 +220,30 @@ def normalize_score_to_100(series: pd.Series) -> pd.Series:
     if s.max(skipna=True) <= 1.0:
         return s * 100
     return s
+
+
+def build_risk_bucket(df: pd.DataFrame, score_col: Optional[str]) -> pd.Series:
+    """
+    Construye buckets robustos incluso si el score tiene formatos irregulares.
+    """
+    if score_col is None or score_col not in df.columns:
+        return pd.Series(["Sin score"] * len(df), index=df.index)
+
+    s = normalize_score_to_100(df[score_col])
+
+    if s.dropna().empty:
+        return pd.Series(["Sin score"] * len(df), index=df.index)
+
+    bucket = pd.cut(
+        s,
+        bins=[-np.inf, 40, 70, 85, np.inf],
+        labels=["Bajo", "Medio", "Alto", "Crítico"]
+    )
+
+    bucket = bucket.astype(object)
+    bucket = bucket.where(pd.notna(bucket), "Sin score")
+
+    return pd.Series(bucket, index=df.index).astype(str)
 
 
 def normalize_size_index(series: pd.Series) -> pd.Series:
@@ -286,7 +310,7 @@ def safe_group_top(
         return pd.DataFrame()
 
     tmp = df.copy()
-    tmp[group_col] = tmp[group_col].fillna("Desconocido").astype(str)
+    tmp[group_col] = safe_string_fill(tmp[group_col])
 
     agg_spec = {"alertas": (group_col, "count")}
     if score_col and score_col in tmp.columns:
@@ -298,6 +322,7 @@ def safe_group_top(
 
     sort_col = "importe_total" if "importe_total" in out.columns else "alertas"
     out = out.sort_values(sort_col, ascending=False).head(top_n)
+
     return out
 
 
@@ -311,10 +336,13 @@ def build_reason_text(row: pd.Series, schema: Dict[str, Optional[str]]) -> str:
     country_col = schema["country"]
     reason_col = schema["reason"]
 
-    if bucket_col in row and pd.notna(row[bucket_col]):
+    if bucket_col in row.index and pd.notna(row[bucket_col]):
         parts.append(f"bucket {row[bucket_col]}")
     if score_col and score_col in row.index and pd.notna(row[score_col]):
-        parts.append(f"score {float(row[score_col]):.2f}")
+        try:
+            parts.append(f"score {float(row[score_col]):.2f}")
+        except Exception:
+            pass
     if amount_col and amount_col in row.index and pd.notna(row[amount_col]):
         parts.append(f"importe {human_format_amount(row[amount_col])}")
     if channel_col and channel_col in row.index and pd.notna(row[channel_col]):
@@ -325,6 +353,10 @@ def build_reason_text(row: pd.Series, schema: Dict[str, Optional[str]]) -> str:
         parts.append(str(row[reason_col]))
 
     return " · ".join(parts[:5]) if parts else "Sin explicación disponible"
+
+
+def build_missing_dimension_message(label: str) -> str:
+    return f"El dataset actual no incluye una dimensión utilizable de **{label}** para esta vista."
 
 
 # =========================================================
@@ -346,24 +378,7 @@ schema = infer_schema(df)
 df = coerce_numeric(df, [schema["score"], schema["amount"], schema["rank"]])
 df = coerce_datetime(df, [schema["timestamp"]])
 
-if schema["risk_bucket"] and schema["risk_bucket"] in df.columns:
-    df["sf_risk_bucket"] = df[schema["risk_bucket"]].astype(str).fillna("Desconocido")
-else:
-    df["sf_risk_bucket"] = build_risk_bucket(df, schema["score"]).astype(str)
-
-if schema["score"] and schema["score"] in df.columns:
-    df["sf_score_100"] = normalize_score_to_100(df[schema["score"]])
-else:
-    df["sf_score_100"] = np.nan
-
-df["sf_priority_score"] = build_priority_score(df, schema)
-df["sf_priority_rank"] = df["sf_priority_score"].rank(method="dense", ascending=False).astype(int)
-
-for col_key in ["country", "channel", "payment_type", "merchant_category", "status"]:
-    c = schema.get(col_key)
-    if c and c in df.columns:
-        df[c] = df[c].fillna("Desconocido").astype(str)
-
+# Variables clave
 amount_col = schema["amount"]
 score_col = schema["score"]
 country_col = schema["country"]
@@ -371,6 +386,30 @@ channel_col = schema["channel"]
 payment_type_col = schema["payment_type"]
 merchant_category_col = schema["merchant_category"]
 status_col = schema["status"]
+
+# Bucket de riesgo robusto
+if schema["risk_bucket"] and schema["risk_bucket"] in df.columns:
+    df["sf_risk_bucket"] = safe_string_fill(df[schema["risk_bucket"]], default="Sin bucket")
+else:
+    df["sf_risk_bucket"] = build_risk_bucket(df, score_col)
+
+df["sf_risk_bucket"] = safe_string_fill(df["sf_risk_bucket"], default="Sin bucket")
+
+# Score estandarizado
+if score_col and score_col in df.columns:
+    df["sf_score_100"] = normalize_score_to_100(df[score_col])
+else:
+    df["sf_score_100"] = np.nan
+
+# Prioridad operativa
+df["sf_priority_score"] = build_priority_score(df, schema)
+df["sf_priority_rank"] = df["sf_priority_score"].rank(method="dense", ascending=False).astype(int)
+
+# Limpieza de dimensiones categóricas
+for col_key in ["country", "channel", "payment_type", "merchant_category", "status"]:
+    c = schema.get(col_key)
+    if c and c in df.columns:
+        df[c] = safe_string_fill(df[c])
 
 df = df.sort_values(["sf_priority_score"], ascending=False).reset_index(drop=True)
 df["sf_priority_reason"] = df.apply(lambda row: build_reason_text(row, schema), axis=1)
@@ -382,22 +421,24 @@ st.markdown(
     """
     **Cómo leer esta página**  
     Esta vista organiza las alertas como una **cola de trabajo priorizada**.  
-    Sirve para decidir **qué revisar primero**, **dónde se concentra la presión operativa**
-    y **qué importe económico está expuesto** en la parte alta de la cola.
+    Está pensada para responder dos preguntas:
+    - **Dirección / negocio:** cuánto riesgo y cuánto importe económico se concentra en la parte alta de la cola.
+    - **Analista antifraude:** qué casos conviene revisar primero y qué variables explican esa prioridad.
     """
 )
 
-with st.expander("Ver fuente y lógica de priorización", expanded=False):
+with st.expander("Ver fuente, lógica de priorización y diagnóstico técnico", expanded=False):
     st.write(f"**Dataset utilizado:** `{dataset_name}`")
+    st.write("**Columnas detectadas por la página:**")
+    st.json(schema)
     st.write(
         """
         La prioridad operativa combina, cuando están disponibles:
-        - score del modelo
-        - importe económico
-        - recencia temporal
+        - **score del modelo**
+        - **importe económico**
+        - **recencia temporal**
 
-        El objetivo es convertir la salida del modelo en una cola de revisión manual
-        creíble y útil para una demo profesional de fraude transaccional.
+        El objetivo es convertir el output analítico en una **cola creíble de revisión manual**.
         """
     )
 
@@ -413,33 +454,35 @@ selected_buckets = st.sidebar.multiselect(
     default=bucket_options
 )
 
+
 def unique_options(base_df: pd.DataFrame, col: Optional[str]) -> List[str]:
     if col and col in base_df.columns:
         return sorted(base_df[col].dropna().astype(str).unique().tolist())
     return []
 
+
 selected_countries = st.sidebar.multiselect(
     "País",
     options=unique_options(df, country_col),
-    default=unique_options(df, country_col)
+    default=unique_options(df, country_col),
 )
 
 selected_channels = st.sidebar.multiselect(
     "Canal",
     options=unique_options(df, channel_col),
-    default=unique_options(df, channel_col)
+    default=unique_options(df, channel_col),
 )
 
 selected_payment_types = st.sidebar.multiselect(
     "Tipo de pago",
     options=unique_options(df, payment_type_col),
-    default=unique_options(df, payment_type_col)
+    default=unique_options(df, payment_type_col),
 )
 
 selected_merchant_categories = st.sidebar.multiselect(
     "Categoría comercio",
     options=unique_options(df, merchant_category_col),
-    default=unique_options(df, merchant_category_col)
+    default=unique_options(df, merchant_category_col),
 )
 
 score_slider_min = 0.0
@@ -539,6 +582,19 @@ c6.metric("Top 10% de la cola", f"{top_10pct_n:,.0f} alertas")
 c7.metric("Importe expuesto Top 10%", human_format_amount(top_10pct_amount) if pd.notna(top_10pct_amount) else "N/A")
 c8.metric("Concentración económica Top 10%", f"{top_10pct_amount_share:.1f}%" if pd.notna(top_10pct_amount_share) else "N/A")
 
+st.markdown(
+    """
+    **Cómo interpretar estas KPIs**
+    - **Alertas en cola:** volumen actual de casos pendientes en la vista filtrada.
+    - **Importe total alertado:** exposición económica agregada de esas alertas.
+    - **Score medio / máximo:** intensidad media y pico de severidad del modelo en la cola.
+    - **% alto + crítico:** proporción de alertas que deberían concentrar la mayor atención operativa.
+    - **Top 10% de la cola:** tramo superior de la priorización calculada.
+    - **Importe expuesto Top 10%:** dinero potencialmente más sensible concentrado en la parte alta.
+    - **Concentración económica Top 10%:** cuánto del importe total está concentrado en muy pocas alertas.
+    """
+)
+
 # =========================================================
 # LECTURA EJECUTIVA
 # =========================================================
@@ -562,25 +618,26 @@ texto = f"""
 - Los buckets **alto + crítico** representan **{critical_share:.1f}%** de la cola filtrada.
 """
 if top_country is not None:
-    texto += f"\n- El principal foco geográfico en esta vista es **{top_country}**."
+    texto += f"\n- El principal foco geográfico visible en esta vista es **{top_country}**."
 if top_channel is not None:
     texto += f"\n- El canal con mayor presión operativa es **{top_channel}**."
-texto += "\n- La lógica recomendada es revisar primero la parte alta de la cola, donde coinciden mayor score, mayor importe y mayor urgencia relativa."
+texto += "\n- La recomendación operativa es comenzar por la parte alta de la cola, donde convergen severidad, importe y urgencia relativa."
 st.markdown(texto)
 
 # =========================================================
 # VISUALES
 # =========================================================
 st.markdown("### Priorización y composición de la cola")
-st.caption("Estos gráficos separan alertas críticas de alertas rutinarias y muestran la concentración operativa.")
+st.caption("Estos gráficos ayudan a separar alertas críticas de alertas más rutinarias y a entender dónde se concentra la carga de revisión.")
 
 left, right = st.columns(2)
 
 with left:
-    bucket_order = ["Crítico", "Alto", "Medio", "Bajo", "Sin score", "Desconocido"]
+    bucket_order = ["Crítico", "Alto", "Medio", "Bajo", "Sin score", "Sin bucket", "Desconocido"]
     bucket_counts = (
         filtered["sf_risk_bucket"]
         .astype(str)
+        .replace(["nan", "None", ""], "Sin bucket")
         .value_counts(dropna=False)
         .rename_axis("bucket")
         .reset_index(name="alertas")
@@ -588,15 +645,20 @@ with left:
     bucket_counts["bucket"] = pd.Categorical(bucket_counts["bucket"], categories=bucket_order, ordered=True)
     bucket_counts = bucket_counts.sort_values("bucket")
 
-    fig_bucket = px.bar(
-        bucket_counts,
-        x="bucket",
-        y="alertas",
-        title="Distribución por risk bucket",
-        text="alertas",
-    )
-    fig_bucket.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
-    st.plotly_chart(fig_bucket, use_container_width=True)
+    if not bucket_counts.empty and bucket_counts["alertas"].sum() > 0:
+        fig_bucket = px.bar(
+            bucket_counts,
+            x="bucket",
+            y="alertas",
+            title="Distribución por risk bucket",
+            text="alertas",
+        )
+        fig_bucket.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
+        st.plotly_chart(fig_bucket, use_container_width=True)
+    else:
+        st.info("No hay datos suficientes para representar buckets de riesgo.")
+
+    st.caption("Separa la cola entre alertas más críticas y alertas más rutinarias.")
 
 with right:
     if amount_col and amount_col in filtered.columns and filtered["sf_score_100"].notna().any():
@@ -618,8 +680,9 @@ with right:
         )
         fig_scatter.update_layout(height=360, xaxis_title="Score (0-100)", yaxis_title="Importe")
         st.plotly_chart(fig_scatter, use_container_width=True)
+        st.caption("La esquina superior derecha suele concentrar las alertas más prioritarias.")
     else:
-        st.info("No hay columnas suficientes para el gráfico de score vs importe.")
+        st.info("El dataset actual no incluye score e importe suficientes para construir este gráfico.")
 
 left2, right2 = st.columns(2)
 
@@ -646,8 +709,9 @@ with left2:
         )
         fig_channel.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
         st.plotly_chart(fig_channel, use_container_width=True)
+        st.caption("Permite identificar canales donde se concentra más carga o severidad.")
     else:
-        st.info("No se encontró una columna de canal.")
+        st.info(build_missing_dimension_message("canal"))
 
 with right2:
     if country_col and country_col in filtered.columns:
@@ -675,14 +739,15 @@ with right2:
         )
         fig_country.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
         st.plotly_chart(fig_country, use_container_width=True)
+        st.caption("Muestra si existe concentración geográfica de alertas o de importe expuesto.")
     else:
-        st.info("No se encontró una columna de país.")
+        st.info(build_missing_dimension_message("país"))
 
 # =========================================================
 # FOCOS PRIORITARIOS
 # =========================================================
 st.markdown("### Focos prioritarios")
-st.caption("Este bloque resume dónde conviene enfocar primero al equipo antifraude.")
+st.caption("Resumen de los segmentos donde conviene concentrar primero la revisión.")
 
 f1, f2 = st.columns(2)
 
@@ -719,8 +784,9 @@ with f1:
         )
         fig_focus.update_layout(height=360, xaxis_title="", yaxis_title="Score medio")
         st.plotly_chart(fig_focus, use_container_width=True)
+        st.caption("Ayuda a localizar tipologías con mayor intensidad media de riesgo.")
     else:
-        st.info("No se encontró payment_type ni merchant_category.")
+        st.info("El dataset actual no incluye una dimensión utilizable de **tipo de pago** o **categoría de comercio**.")
 
 with f2:
     if country_col and country_col in filtered.columns and channel_col and channel_col in filtered.columns:
@@ -740,15 +806,17 @@ with f2:
             )
             fig_heat.update_layout(height=360, xaxis_title="", yaxis_title="")
             st.plotly_chart(fig_heat, use_container_width=True)
+            st.caption("Útil para detectar combinaciones operativas donde la presión de alertas es mayor.")
         else:
-            st.info("No hay datos suficientes para país × canal.")
+            st.info("No hay datos suficientes para construir la matriz país × canal.")
     else:
-        st.info("No hay columnas suficientes para país × canal.")
+        st.info("El dataset actual no incluye simultáneamente dimensiones utilizables de **país** y **canal**.")
 
 # =========================================================
 # TABLAS RESUMEN
 # =========================================================
 st.markdown("### Casos más críticos / focos prioritarios")
+st.caption("Resumen tabular de los segmentos que concentran mayor volumen, severidad o exposición.")
 
 tabs = st.tabs(["Países", "Canales", "Tipologías"])
 
@@ -759,9 +827,9 @@ with tabs[0]:
             out["score_medio"] = out["score_medio"].round(1)
         if "importe_total" in out.columns:
             out["importe_total"] = out["importe_total"].round(2)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.dataframe(drop_duplicate_columns(out), use_container_width=True, hide_index=True)
     else:
-        st.info("No hay columna de país disponible.")
+        st.info(build_missing_dimension_message("país"))
 
 with tabs[1]:
     out = safe_group_top(filtered, channel_col, "sf_score_100", amount_col, top_n=12)
@@ -770,9 +838,9 @@ with tabs[1]:
             out["score_medio"] = out["score_medio"].round(1)
         if "importe_total" in out.columns:
             out["importe_total"] = out["importe_total"].round(2)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.dataframe(drop_duplicate_columns(out), use_container_width=True, hide_index=True)
     else:
-        st.info("No hay columna de canal disponible.")
+        st.info(build_missing_dimension_message("canal"))
 
 with tabs[2]:
     tipology_col = payment_type_col if payment_type_col and payment_type_col in filtered.columns else merchant_category_col
@@ -782,15 +850,15 @@ with tabs[2]:
             out["score_medio"] = out["score_medio"].round(1)
         if "importe_total" in out.columns:
             out["importe_total"] = out["importe_total"].round(2)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.dataframe(drop_duplicate_columns(out), use_container_width=True, hide_index=True)
     else:
-        st.info("No hay payment_type ni merchant_category disponible.")
+        st.info("El dataset actual no incluye una dimensión utilizable de **tipo de pago** o **categoría de comercio**.")
 
 # =========================================================
 # TABLA OPERATIVA PRINCIPAL
 # =========================================================
 st.markdown("### Cola operativa de revisión")
-st.caption("Tabla principal para priorizar trabajo manual. La recomendación es ordenar por prioridad operativa o por score.")
+st.caption("Tabla principal para trabajo manual. La recomendación es ordenar por prioridad operativa y revisar primero la parte alta de la cola.")
 
 sort_options = {
     "Prioridad operativa": "sf_priority_score",
@@ -822,7 +890,6 @@ display_cols = [
 for c in [
     schema["id"],
     schema["timestamp"],
-    schema["score"],
     "sf_score_100",
     schema["amount"],
     schema["country"],
@@ -833,8 +900,10 @@ for c in [
     schema["customer_id"],
     schema["status"],
 ]:
-    if c and c in filtered.columns and c not in display_cols:
+    if c and c in filtered.columns:
         display_cols.append(c)
+
+display_cols = unique_preserve_order(display_cols)
 
 table_df = filtered.sort_values(selected_sort_col, ascending=sort_ascending).copy()
 
@@ -847,23 +916,26 @@ rename_map = {
 }
 
 table_df = table_df.rename(columns=rename_map)
+table_df = drop_duplicate_columns(table_df)
 
 visible_cols = []
 for c in display_cols:
-    if c in rename_map:
-        visible_cols.append(rename_map[c])
-    elif c in table_df.columns:
-        visible_cols.append(c)
+    renamed = rename_map.get(c, c)
+    if renamed in table_df.columns:
+        visible_cols.append(renamed)
 
-visible_cols = [c for c in visible_cols if c in table_df.columns]
+visible_cols = unique_preserve_order(visible_cols)
+
+operational_df = table_df[visible_cols].head(max_rows).copy()
+operational_df = drop_duplicate_columns(operational_df)
 
 st.dataframe(
-    table_df[visible_cols].head(max_rows),
+    operational_df,
     use_container_width=True,
     hide_index=True,
 )
 
-csv_export = table_df[visible_cols].to_csv(index=False).encode("utf-8")
+csv_export = operational_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Descargar cola filtrada en CSV",
     data=csv_export,
@@ -875,7 +947,7 @@ st.download_button(
 # TOP CASOS CRÍTICOS
 # =========================================================
 st.markdown("### Top casos críticos")
-st.caption("Selección corta de alertas que combinan prioridad operativa, severidad y exposición económica.")
+st.caption("Selección reducida de alertas donde coinciden prioridad operativa, severidad y posible exposición económica.")
 
 top_n_cases = st.slider("Número de casos críticos visibles", min_value=10, max_value=100, value=25, step=5)
 
@@ -888,6 +960,7 @@ if amount_col and amount_col in filtered.columns:
 
 top_cases = filtered.sort_values(sort_cols, ascending=ascending_flags).head(top_n_cases).copy()
 top_cases = top_cases.rename(columns=rename_map)
+top_cases = drop_duplicate_columns(top_cases)
 
 top_cols = []
 for c in [
@@ -906,15 +979,17 @@ for c in [
     schema["merchant_id"],
     schema["customer_id"],
 ]:
-    if c in rename_map:
-        top_cols.append(rename_map[c])
-    elif c and c in top_cases.columns:
-        top_cols.append(c)
+    renamed = rename_map.get(c, c)
+    if renamed in top_cases.columns:
+        top_cols.append(renamed)
 
-top_cols = [c for c in top_cols if c in top_cases.columns]
+top_cols = unique_preserve_order(top_cols)
+
+top_cases_view = top_cases[top_cols].copy()
+top_cases_view = drop_duplicate_columns(top_cases_view)
 
 st.dataframe(
-    top_cases[top_cols],
+    top_cases_view,
     use_container_width=True,
     hide_index=True,
 )
