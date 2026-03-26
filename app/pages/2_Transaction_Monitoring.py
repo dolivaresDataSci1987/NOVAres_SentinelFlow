@@ -830,7 +830,44 @@ peak_alerts = None
 
 if not daily_filtered.empty:
     if "transactions" in daily_filtered.columns:
-        total_transactions = daily_filtered["transactions"].sum()
+        total_transactions = pd.to_numeric(daily_filtered["transactions"], errors="coerce").sum()
+
+    if "alerts" in daily_filtered.columns:
+        total_alerts = pd.to_numeric(daily_filtered["alerts"], errors="coerce").sum()
+
+    if total_transactions not in [None, 0] and pd.notna(total_transactions) and total_alerts is not None:
+        alert_rate = total_alerts / total_transactions
+
+    if "avg_score" in daily_filtered.columns:
+        avg_score = pd.to_numeric(daily_filtered["avg_score"], errors="coerce").mean()
+
+    if "alerts" in daily_filtered.columns and "monitoring_date" in daily_filtered.columns:
+        peak_row = daily_filtered.sort_values("alerts", ascending=False).head(1)
+        if not peak_row.empty:
+            peak_alert_day = pd.to_datetime(peak_row.iloc[0]["monitoring_date"]).date()
+            peak_alerts = peak_row.iloc[0]["alerts"]
+
+# fallback 1: si daily_monitoring no trae volumen, usar scored_df directo
+if total_transactions in [None, 0] or pd.isna(total_transactions):
+    if scored_df is not None and not scored_df.empty:
+        total_transactions = len(scored_df)
+
+# fallback 2: si sigue sin haber alert rate, calcularlo con alert queue
+if (alert_rate is None or pd.isna(alert_rate)) and total_transactions not in [None, 0] and total_alerts is not None:
+    alert_rate = total_alerts / total_transactions
+
+# fallback 3: score medio desde scored_df
+if avg_score is None or pd.isna(avg_score):
+    possible_score_cols = ["fraud_score", "score", "prediction_score", "risk_score", "model_score"]
+    lower_map = {str(c).lower(): c for c in scored_df.columns}
+    score_col = None
+    for c in possible_score_cols:
+        if c.lower() in lower_map:
+            score_col = lower_map[c.lower()]
+            break
+
+    if score_col is not None:
+        avg_score = pd.to_numeric(scored_df[score_col], errors="coerce").mean()
 
     if "alerts" in daily_filtered.columns:
         total_alerts = daily_filtered["alerts"].sum()
