@@ -42,21 +42,30 @@ CSV_FILES = {
 }
 
 
+def _try_read_csv(path: Path, **kwargs) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, **kwargs)
+    except Exception:
+        return pd.DataFrame()
+
+
 def _safe_read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
 
-    return pd.read_csv(path)
+    attempts = [
+        {"low_memory": False},
+        {"sep": ";", "low_memory": False},
+        {"encoding": "latin-1", "low_memory": False},
+        {"sep": ";", "encoding": "latin-1", "low_memory": False},
+    ]
 
+    for kwargs in attempts:
+        df = _try_read_csv(path, **kwargs)
+        if not df.empty or path.stat().st_size == 0:
+            return df
 
-@pd.api.extensions.register_dataframe_accessor("sfmeta")
-class SentinelFlowMetaAccessor:
-    def __init__(self, pandas_obj: pd.DataFrame):
-        self._obj = pandas_obj
-
-    @property
-    def empty_or_none(self) -> bool:
-        return self._obj is None or self._obj.empty
+    return pd.DataFrame()
 
 
 def get_dashboard_exports_dir() -> Path:
@@ -72,6 +81,7 @@ def list_expected_files() -> pd.DataFrame:
                 "dataset_name": dataset_name,
                 "filename": filename,
                 "exists": path.exists(),
+                "size_mb": round(path.stat().st_size / (1024 * 1024), 3) if path.exists() else None,
                 "path": str(path),
             }
         )
@@ -130,38 +140,51 @@ def extract_kpi_value(
     candidate_keys: List[str],
     value_column_candidates: Optional[List[str]] = None,
 ) -> Optional[float]:
-    """
-    Intenta recuperar un KPI desde executive_kpis.csv de forma robusta.
-    Busca una fila cuyo nombre/clave coincida con alguno de los candidate_keys.
-    """
-
     if executive_kpis_df is None or executive_kpis_df.empty:
         return None
 
     df = executive_kpis_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    possible_key_cols = [c for c in df.columns if c.lower() in {"kpi", "metric", "metric_name", "name", "key"}]
+    possible_key_cols = [
+        c for c in df.columns
+        if c.lower() in {"kpi", "metric", "metric_name", "name", "key", "metric_key"}
+    ]
     possible_value_cols = value_column_candidates or [
-        c for c in df.columns if c.lower() in {"value", "metric_value", "kpi_value"}
+        c for c in df.columns
+        if c.lower() in {"value", "metric_value", "kpi_value", "metric_result"}
     ]
 
-    if not possible_key_cols or not possible_value_cols:
-        return None
+    if possible_key_cols and possible_value_cols:
+        key_col = possible_key_cols[0]
+        value_col = possible_value_cols[0]
 
-    key_col = possible_key_cols[0]
-    value_col = possible_value_cols[0]
+        df[key_col] = df[key_col].astype(str).str.strip().str.lower()
+        for key in candidate_keys:
+            mask = df[key_col] == key.strip().lower()
+            if mask.any():
+                value = df.loc[mask, value_col].iloc[0]
+                try:
+                    return float(value)
+                except Exception:
+                    pass
 
-    df[key_col] = df[key_col].astype(str).str.strip().str.lower()
+    flat_candidates = []
+    for col in df.columns:
+        for _, row in df.iterrows():
+            cell = str(row[col]).strip().lower()
+            if cell in [k.strip().lower() for k in candidate_keys]:
+                for maybe_val_col in df.columns:
+                    if maybe_val_col == col:
+                        continue
+                    try:
+                        value = float(row[maybe_val_col])
+                        flat_candidates.append(value)
+                    except Exception:
+                        continue
 
-    for key in candidate_keys:
-        mask = df[key_col] == key.strip().lower()
-        if mask.any():
-            value = df.loc[mask, value_col].iloc[0]
-            try:
-                return float(value)
-            except Exception:
-                return None
+    if flat_candidates:
+        return flat_candidates[0]
 
     return None
 
@@ -174,9 +197,10 @@ def infer_main_transaction_date_column(df: pd.DataFrame) -> Optional[str]:
         "date",
         "timestamp",
     ]
+    lower_map = {str(c).lower(): c for c in df.columns}
     for col in candidates:
-        if col in df.columns:
-            return col
+        if col.lower() in lower_map:
+            return lower_map[col.lower()]
     return None
 
 
