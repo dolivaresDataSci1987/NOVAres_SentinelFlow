@@ -127,10 +127,31 @@ def pick_alert_dataset(datasets: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame,
 
         ncols = [normalize_colname(c) for c in df.columns]
 
-        if any(c in ncols for c in ["risk_score", "fraud_probability", "model_score", "alert_score", "score", "fraud_score", "predicted_probability"]):
+        if any(
+            c in ncols
+            for c in [
+                "risk_score",
+                "fraud_probability",
+                "model_score",
+                "alert_score",
+                "score",
+                "fraud_score",
+                "predicted_probability",
+            ]
+        ):
             score += 5
 
-        if any(c in ncols for c in ["transaction_amount", "amount", "amount_eur", "usd_amount", "payment_amount", "tx_amount"]):
+        if any(
+            c in ncols
+            for c in [
+                "transaction_amount",
+                "amount",
+                "amount_eur",
+                "usd_amount",
+                "payment_amount",
+                "tx_amount",
+            ]
+        ):
             score += 3
 
         if any(c in ncols for c in ["transaction_id", "alert_id", "case_id"]):
@@ -355,9 +376,6 @@ def build_reason_text(row: pd.Series, schema: Dict[str, Optional[str]]) -> str:
     return " · ".join(parts[:5]) if parts else "Sin explicación disponible"
 
 
-def build_missing_dimension_message(label: str) -> str:
-    return f"El dataset actual no incluye una dimensión utilizable de **{label}** para esta vista."
-
 def choose_best_focus_dimension(
     df: pd.DataFrame,
     schema: Dict[str, Optional[str]],
@@ -395,6 +413,7 @@ def safe_top_value(df: pd.DataFrame, col: Optional[str]) -> Optional[str]:
             return str(vc.index[0])
     return None
 
+
 # =========================================================
 # LOAD + PREPARE DATA
 # =========================================================
@@ -414,7 +433,6 @@ schema = infer_schema(df)
 df = coerce_numeric(df, [schema["score"], schema["amount"], schema["rank"]])
 df = coerce_datetime(df, [schema["timestamp"]])
 
-# Variables clave
 amount_col = schema["amount"]
 score_col = schema["score"]
 country_col = schema["country"]
@@ -423,7 +441,20 @@ payment_type_col = schema["payment_type"]
 merchant_category_col = schema["merchant_category"]
 status_col = schema["status"]
 
-# Bucket de riesgo robusto
+secondary_focus_col, secondary_focus_label = choose_best_focus_dimension(
+    df,
+    schema,
+    preferred_order=[
+        "country",
+        "merchant_category",
+        "payment_type",
+        "merchant_id",
+        "customer_id",
+        "status",
+        "reason",
+    ],
+)
+
 if schema["risk_bucket"] and schema["risk_bucket"] in df.columns:
     df["sf_risk_bucket"] = safe_string_fill(df[schema["risk_bucket"]], default="Sin bucket")
 else:
@@ -431,17 +462,14 @@ else:
 
 df["sf_risk_bucket"] = safe_string_fill(df["sf_risk_bucket"], default="Sin bucket")
 
-# Score estandarizado
 if score_col and score_col in df.columns:
     df["sf_score_100"] = normalize_score_to_100(df[score_col])
 else:
     df["sf_score_100"] = np.nan
 
-# Prioridad operativa
 df["sf_priority_score"] = build_priority_score(df, schema)
 df["sf_priority_rank"] = df["sf_priority_score"].rank(method="dense", ascending=False).astype(int)
 
-# Limpieza de dimensiones categóricas
 for col_key in ["country", "channel", "payment_type", "merchant_category", "status"]:
     c = schema.get(col_key)
     if c and c in df.columns:
@@ -636,25 +664,16 @@ st.markdown(
 # =========================================================
 st.markdown("### Lectura ejecutiva / operativa")
 
-top_country = None
-if country_col and country_col in filtered.columns:
-    x = filtered[country_col].value_counts()
-    if not x.empty:
-        top_country = x.index[0]
-
-top_channel = None
-if channel_col and channel_col in filtered.columns:
-    x = filtered[channel_col].value_counts()
-    if not x.empty:
-        top_channel = x.index[0]
+top_focus_value = safe_top_value(filtered, secondary_focus_col)
+top_channel = safe_top_value(filtered, channel_col)
 
 texto = f"""
 - La cola actual contiene **{total_alerts:,.0f} alertas**.
 - El **Top 10%** concentra **{top_10pct_amount_share:.1f}% del importe alertado**.
 - Los buckets **alto + crítico** representan **{critical_share:.1f}%** de la cola filtrada.
 """
-if top_country is not None:
-    texto += f"\n- El principal foco geográfico visible en esta vista es **{top_country}**."
+if top_focus_value is not None and secondary_focus_label is not None:
+    texto += f"\n- El principal foco visible en esta vista por **{secondary_focus_label}** es **{top_focus_value}**."
 if top_channel is not None:
     texto += f"\n- El canal con mayor presión operativa es **{top_channel}**."
 texto += "\n- La recomendación operativa es comenzar por la parte alta de la cola, donde convergen severidad, importe y urgencia relativa."
@@ -699,9 +718,17 @@ with left:
 with right:
     if amount_col and amount_col in filtered.columns and filtered["sf_score_100"].notna().any():
         scatter_df = filtered.head(2000).copy()
-        hover_cols = [c for c in [
-            schema["id"], country_col, channel_col, payment_type_col, merchant_category_col, "sf_risk_bucket"
-        ] if c and c in scatter_df.columns]
+        hover_cols = [
+            c for c in [
+                schema["id"],
+                country_col,
+                channel_col,
+                payment_type_col,
+                merchant_category_col,
+                "sf_risk_bucket",
+            ]
+            if c and c in scatter_df.columns
+        ]
 
         scatter_df["sf_size"] = normalize_size_index(scatter_df[amount_col])
 
@@ -747,37 +774,39 @@ with left2:
         st.plotly_chart(fig_channel, use_container_width=True)
         st.caption("Permite identificar canales donde se concentra más carga o severidad.")
     else:
-        st.info(build_missing_dimension_message("canal"))
+        st.info("El dataset actual no incluye una dimensión utilizable de **canal** para esta vista.")
 
 with right2:
-    if country_col and country_col in filtered.columns:
-        agg_dict = {"alertas": (country_col, "count")}
+    if secondary_focus_col and secondary_focus_col in filtered.columns:
+        agg_dict = {"alertas": (secondary_focus_col, "count")}
         if amount_col and amount_col in filtered.columns:
             agg_dict["importe_total"] = (amount_col, "sum")
 
-        country_agg = (
-            filtered.groupby(country_col)
+        focus_agg = (
+            filtered.groupby(secondary_focus_col)
             .agg(**agg_dict)
             .reset_index()
             .sort_values("alertas", ascending=False)
             .head(12)
         )
 
-        color_col = "importe_total" if "importe_total" in country_agg.columns else "alertas"
+        color_col = "importe_total" if "importe_total" in focus_agg.columns else "alertas"
 
-        fig_country = px.bar(
-            country_agg,
-            x=country_col,
+        fig_focus_dim = px.bar(
+            focus_agg,
+            x=secondary_focus_col,
             y="alertas",
             color=color_col,
-            title="Alertas por país",
+            title=f"Alertas por {secondary_focus_label}",
             text="alertas",
         )
-        fig_country.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
-        st.plotly_chart(fig_country, use_container_width=True)
-        st.caption("Muestra si existe concentración geográfica de alertas o de importe expuesto.")
+        fig_focus_dim.update_layout(height=360, xaxis_title="", yaxis_title="Alertas")
+        st.plotly_chart(fig_focus_dim, use_container_width=True)
+        st.caption(
+            f"Muestra si existe concentración de alertas o de importe expuesto por {secondary_focus_label}."
+        )
     else:
-        st.info(build_missing_dimension_message("país"))
+        st.info("No se encontró una dimensión secundaria utilizable para este análisis.")
 
 # =========================================================
 # FOCOS PRIORITARIOS
@@ -825,9 +854,9 @@ with f1:
         st.info("El dataset actual no incluye una dimensión utilizable de **tipo de pago** o **categoría de comercio**.")
 
 with f2:
-    if country_col and country_col in filtered.columns and channel_col and channel_col in filtered.columns:
+    if secondary_focus_col and secondary_focus_col in filtered.columns and channel_col and channel_col in filtered.columns:
         heat_df = (
-            filtered.groupby([country_col, channel_col])
+            filtered.groupby([secondary_focus_col, channel_col])
             .size()
             .reset_index(name="alertas")
         )
@@ -836,17 +865,19 @@ with f2:
             fig_heat = px.density_heatmap(
                 heat_df,
                 x=channel_col,
-                y=country_col,
+                y=secondary_focus_col,
                 z="alertas",
-                title="Concentración país × canal",
+                title=f"Concentración {secondary_focus_label} × canal",
             )
             fig_heat.update_layout(height=360, xaxis_title="", yaxis_title="")
             st.plotly_chart(fig_heat, use_container_width=True)
-            st.caption("Útil para detectar combinaciones operativas donde la presión de alertas es mayor.")
+            st.caption(
+                f"Útil para detectar combinaciones operativas donde la presión de alertas es mayor por {secondary_focus_label} y canal."
+            )
         else:
-            st.info("No hay datos suficientes para construir la matriz país × canal.")
+            st.info(f"No hay datos suficientes para construir la matriz {secondary_focus_label} × canal.")
     else:
-        st.info("El dataset actual no incluye simultáneamente dimensiones utilizables de **país** y **canal**.")
+        st.info("No hay columnas suficientes para construir una matriz operativa con canal.")
 
 # =========================================================
 # TABLAS RESUMEN
@@ -854,10 +885,11 @@ with f2:
 st.markdown("### Casos más críticos / focos prioritarios")
 st.caption("Resumen tabular de los segmentos que concentran mayor volumen, severidad o exposición.")
 
-tabs = st.tabs(["Países", "Canales", "Tipologías"])
+tab_1_label = secondary_focus_label.capitalize() if secondary_focus_label else "Focos"
+tabs = st.tabs([tab_1_label, "Canales", "Tipologías"])
 
 with tabs[0]:
-    out = safe_group_top(filtered, country_col, "sf_score_100", amount_col, top_n=12)
+    out = safe_group_top(filtered, secondary_focus_col, "sf_score_100", amount_col, top_n=12)
     if not out.empty:
         if "score_medio" in out.columns:
             out["score_medio"] = out["score_medio"].round(1)
@@ -865,7 +897,7 @@ with tabs[0]:
             out["importe_total"] = out["importe_total"].round(2)
         st.dataframe(drop_duplicate_columns(out), use_container_width=True, hide_index=True)
     else:
-        st.info(build_missing_dimension_message("país"))
+        st.info("No se encontró una dimensión principal utilizable para este resumen.")
 
 with tabs[1]:
     out = safe_group_top(filtered, channel_col, "sf_score_100", amount_col, top_n=12)
@@ -876,7 +908,7 @@ with tabs[1]:
             out["importe_total"] = out["importe_total"].round(2)
         st.dataframe(drop_duplicate_columns(out), use_container_width=True, hide_index=True)
     else:
-        st.info(build_missing_dimension_message("canal"))
+        st.info("El dataset actual no incluye una dimensión utilizable de **canal** para esta vista.")
 
 with tabs[2]:
     tipology_col = payment_type_col if payment_type_col and payment_type_col in filtered.columns else merchant_category_col
@@ -906,8 +938,8 @@ if amount_col and amount_col in filtered.columns:
     sort_options["Importe"] = amount_col
 if schema["timestamp"] and schema["timestamp"] in filtered.columns:
     sort_options["Fecha"] = schema["timestamp"]
-if country_col and country_col in filtered.columns:
-    sort_options["País"] = country_col
+if secondary_focus_col and secondary_focus_col in filtered.columns:
+    sort_options[secondary_focus_label.capitalize()] = secondary_focus_col
 if channel_col and channel_col in filtered.columns:
     sort_options["Canal"] = channel_col
 
@@ -928,7 +960,7 @@ for c in [
     schema["timestamp"],
     "sf_score_100",
     schema["amount"],
-    schema["country"],
+    secondary_focus_col,
     schema["channel"],
     schema["payment_type"],
     schema["merchant_category"],
@@ -1008,7 +1040,7 @@ for c in [
     schema["timestamp"],
     "sf_score_100",
     schema["amount"],
-    schema["country"],
+    secondary_focus_col,
     schema["channel"],
     schema["payment_type"],
     schema["merchant_category"],
