@@ -1,211 +1,210 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any
 
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parents[2]
+DASHBOARD_EXPORTS_DIR = ROOT / "artifacts" / "dashboard_exports"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DASHBOARD_EXPORTS_DIR = PROJECT_ROOT / "artifacts" / "dashboard_exports"
-
-
-CSV_FILES = {
+DATASET_FILE_MAP: dict[str, str] = {
     "dashboard_scored_transactions": "dashboard_scored_transactions.csv",
+    "executive_kpis": "executive_kpis.csv",
     "alert_queue": "alert_queue.csv",
     "review_queue_top_1pct": "review_queue_top_1pct.csv",
     "review_queue_top_3pct": "review_queue_top_3pct.csv",
     "review_queue_top_5pct": "review_queue_top_5pct.csv",
     "review_queue_top_10pct": "review_queue_top_10pct.csv",
-    "executive_kpis": "executive_kpis.csv",
-    "daily_monitoring": "daily_monitoring.csv",
-    "daily_channel_monitoring": "daily_channel_monitoring.csv",
-    "channel_summary": "channel_summary.csv",
-    "merchant_category_summary": "merchant_category_summary.csv",
-    "customer_segment_summary": "customer_segment_summary.csv",
-    "payment_type_summary": "payment_type_summary.csv",
-    "merchant_risk_level_summary": "merchant_risk_level_summary.csv",
-    "transaction_country_summary": "transaction_country_summary.csv",
-    "suspicious_customers": "suspicious_customers.csv",
-    "suspicious_merchants": "suspicious_merchants.csv",
-    "suspicious_devices": "suspicious_devices.csv",
-    "suspicious_payment_methods": "suspicious_payment_methods.csv",
-    "alert_composition": "alert_composition.csv",
-    "alert_mix_by_channel": "alert_mix_by_channel.csv",
-    "alert_mix_by_merchant_category": "alert_mix_by_merchant_category.csv",
     "queue_summary": "queue_summary.csv",
-    "top_scored_transactions": "top_scored_transactions.csv",
-    "top_true_positive_cases": "top_true_positive_cases.csv",
-    "top_false_positive_cases": "top_false_positive_cases.csv",
-    "top_false_negative_cases": "top_false_negative_cases.csv",
     "output_inventory": "output_inventory.csv",
 }
 
 
-def _try_read_csv(path: Path, **kwargs) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path, **kwargs)
-    except Exception:
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    out.columns = [str(c).replace("\ufeff", "").strip() for c in out.columns]
+    return out
+
+
+def _drop_fully_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    keep_cols = [c for c in df.columns if not str(c).lower().startswith("unnamed:")]
+    return df.loc[:, keep_cols].copy()
+
+
+def _read_csv_robust(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
 
-
-def _safe_read_csv(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-
-    attempts = [
-        {"low_memory": False},
-        {"sep": ";", "low_memory": False},
-        {"encoding": "latin-1", "low_memory": False},
-        {"sep": ";", "encoding": "latin-1", "low_memory": False},
+    read_attempts: list[dict[str, Any]] = [
+        {"sep": ",", "encoding": "utf-8"},
+        {"sep": None, "engine": "python", "encoding": "utf-8"},
+        {"sep": ",", "encoding": "utf-8-sig"},
+        {"sep": ";", "encoding": "utf-8"},
+        {"sep": ";", "encoding": "utf-8-sig"},
+        {"sep": None, "engine": "python", "encoding": "latin-1"},
     ]
 
-    for kwargs in attempts:
-        df = _try_read_csv(path, **kwargs)
-        if not df.empty or path.stat().st_size == 0:
-            return df
+    best_df = pd.DataFrame()
+    best_score = -1
 
-    return pd.DataFrame()
+    for kwargs in read_attempts:
+        try:
+            df = pd.read_csv(path, **kwargs)
+            df = _normalize_columns(df)
+            df = _drop_fully_unnamed_columns(df)
+
+            if df.empty:
+                continue
+
+            n_cols = len(df.columns)
+            n_rows = len(df)
+            single_col_penalty = 1000 if n_cols == 1 else 0
+            score = (n_cols * 1000) + n_rows - single_col_penalty
+
+            if score > best_score:
+                best_df = df
+                best_score = score
+
+            if n_cols > 1:
+                return df
+
+        except Exception:
+            continue
+
+    return best_df
 
 
-def get_dashboard_exports_dir() -> Path:
-    return DASHBOARD_EXPORTS_DIR
+def load_dataset(dataset_name: str) -> pd.DataFrame:
+    filename = DATASET_FILE_MAP.get(dataset_name, f"{dataset_name}.csv")
+    path = DASHBOARD_EXPORTS_DIR / filename
+    return _read_csv_robust(path)
+
+
+def load_selected_datasets(dataset_names: list[str]) -> dict[str, pd.DataFrame]:
+    return {dataset_name: load_dataset(dataset_name) for dataset_name in dataset_names}
 
 
 def list_expected_files() -> pd.DataFrame:
-    rows = []
-    for dataset_name, filename in CSV_FILES.items():
+    rows: list[dict[str, Any]] = []
+
+    for dataset_name, filename in DATASET_FILE_MAP.items():
         path = DASHBOARD_EXPORTS_DIR / filename
+        exists = path.exists()
+        size_bytes = path.stat().st_size if exists else None
+
+        detected_shape = None
+        detected_columns = None
+
+        if exists and size_bytes and size_bytes > 0:
+            try:
+                sample_df = _read_csv_robust(path)
+                detected_shape = tuple(sample_df.shape)
+                detected_columns = len(sample_df.columns)
+            except Exception:
+                detected_shape = None
+                detected_columns = None
+
         rows.append(
             {
                 "dataset_name": dataset_name,
                 "filename": filename,
-                "exists": path.exists(),
-                "size_mb": round(path.stat().st_size / (1024 * 1024), 3) if path.exists() else None,
+                "exists": exists,
+                "size_bytes": size_bytes,
+                "detected_shape": detected_shape,
+                "detected_columns": detected_columns,
                 "path": str(path),
             }
         )
+
     return pd.DataFrame(rows)
 
 
-def load_dataset(dataset_name: str) -> pd.DataFrame:
-    if dataset_name not in CSV_FILES:
-        raise ValueError(f"Unknown dataset_name: {dataset_name}")
+def first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty:
+        return None
 
-    path = DASHBOARD_EXPORTS_DIR / CSV_FILES[dataset_name]
-    return _safe_read_csv(path)
-
-
-def load_selected_datasets(dataset_names: List[str]) -> Dict[str, pd.DataFrame]:
-    return {name: load_dataset(name) for name in dataset_names}
-
-
-def load_core_dashboard_data() -> Dict[str, pd.DataFrame]:
-    core_names = [
-        "dashboard_scored_transactions",
-        "alert_queue",
-        "review_queue_top_1pct",
-        "review_queue_top_3pct",
-        "review_queue_top_5pct",
-        "review_queue_top_10pct",
-        "executive_kpis",
-        "daily_monitoring",
-        "channel_summary",
-        "merchant_category_summary",
-        "customer_segment_summary",
-        "payment_type_summary",
-        "merchant_risk_level_summary",
-        "transaction_country_summary",
-        "suspicious_customers",
-        "suspicious_merchants",
-        "suspicious_devices",
-        "suspicious_payment_methods",
-        "alert_composition",
-        "queue_summary",
-        "top_scored_transactions",
-        "top_true_positive_cases",
-        "top_false_positive_cases",
-        "top_false_negative_cases",
-        "output_inventory",
-    ]
-    return load_selected_datasets(core_names)
+    lower_map = {str(c).lower(): c for c in df.columns}
+    for candidate in candidates:
+        match = lower_map.get(str(candidate).lower())
+        if match is not None:
+            return match
+    return None
 
 
-def load_all_dashboard_data() -> Dict[str, pd.DataFrame]:
-    return {name: load_dataset(name) for name in CSV_FILES.keys()}
+def infer_main_transaction_date_column(df: pd.DataFrame) -> str | None:
+    return first_existing_col(
+        df,
+        [
+            "transaction_ts",
+            "transaction_datetime",
+            "event_ts",
+            "event_datetime",
+            "scored_at",
+            "transaction_date",
+            "date",
+        ],
+    )
+
+
+def parse_datetime_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    if df is None or df.empty or column not in df.columns:
+        return df
+
+    out = df.copy()
+    out[column] = pd.to_datetime(out[column], errors="coerce")
+    return out
 
 
 def extract_kpi_value(
-    executive_kpis_df: pd.DataFrame,
-    candidate_keys: List[str],
-    value_column_candidates: Optional[List[str]] = None,
-) -> Optional[float]:
-    if executive_kpis_df is None or executive_kpis_df.empty:
+    df: pd.DataFrame,
+    candidate_keys: list[str],
+) -> float | None:
+    if df is None or df.empty:
         return None
 
-    df = executive_kpis_df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    normalized_keys = {str(k).strip().lower() for k in candidate_keys}
 
-    possible_key_cols = [
-        c for c in df.columns
-        if c.lower() in {"kpi", "metric", "metric_name", "name", "key", "metric_key"}
-    ]
-    possible_value_cols = value_column_candidates or [
-        c for c in df.columns
-        if c.lower() in {"value", "metric_value", "kpi_value", "metric_result"}
-    ]
+    # 1) Wide format: KPI names as columns
+    wide_col_map = {str(c).strip().lower(): c for c in df.columns}
+    for key in candidate_keys:
+        col = wide_col_map.get(str(key).strip().lower())
+        if col is not None:
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if not series.empty:
+                return float(series.iloc[0])
 
-    if possible_key_cols and possible_value_cols:
-        key_col = possible_key_cols[0]
-        value_col = possible_value_cols[0]
+    # 2) Long format: key/value table
+    possible_key_cols = ["metric", "kpi", "key", "name", "metric_name", "kpi_name"]
+    possible_value_cols = ["value", "metric_value", "kpi_value", "metric_result", "score"]
 
-        df[key_col] = df[key_col].astype(str).str.strip().str.lower()
-        for key in candidate_keys:
-            mask = df[key_col] == key.strip().lower()
-            if mask.any():
-                value = df.loc[mask, value_col].iloc[0]
-                try:
-                    return float(value)
-                except Exception:
-                    pass
+    key_col = first_existing_col(df, possible_key_cols)
+    value_col = first_existing_col(df, possible_value_cols)
 
-    flat_candidates = []
-    for col in df.columns:
-        for _, row in df.iterrows():
-            cell = str(row[col]).strip().lower()
-            if cell in [k.strip().lower() for k in candidate_keys]:
-                for maybe_val_col in df.columns:
-                    if maybe_val_col == col:
-                        continue
-                    try:
-                        value = float(row[maybe_val_col])
-                        flat_candidates.append(value)
-                    except Exception:
-                        continue
+    if key_col is not None and value_col is not None:
+        tmp = df.copy()
+        tmp[key_col] = tmp[key_col].astype(str).str.strip().str.lower()
+        match = tmp[tmp[key_col].isin(normalized_keys)]
+        if not match.empty:
+            series = pd.to_numeric(match[value_col], errors="coerce").dropna()
+            if not series.empty:
+                return float(series.iloc[0])
 
-    if flat_candidates:
-        return flat_candidates[0]
+    # 3) Two-column fallback
+    if df.shape[1] >= 2:
+        col1, col2 = df.columns[:2]
+        tmp = df[[col1, col2]].copy()
+        tmp[col1] = tmp[col1].astype(str).str.strip().str.lower()
+        match = tmp[tmp[col1].isin(normalized_keys)]
+        if not match.empty:
+            series = pd.to_numeric(match[col2], errors="coerce").dropna()
+            if not series.empty:
+                return float(series.iloc[0])
 
     return None
-
-
-def infer_main_transaction_date_column(df: pd.DataFrame) -> Optional[str]:
-    candidates = [
-        "transaction_date",
-        "transaction_ts",
-        "event_date",
-        "date",
-        "timestamp",
-    ]
-    lower_map = {str(c).lower(): c for c in df.columns}
-    for col in candidates:
-        if col.lower() in lower_map:
-            return lower_map[col.lower()]
-    return None
-
-
-def parse_datetime_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    out = df.copy()
-    if col in out.columns:
-        out[col] = pd.to_datetime(out[col], errors="coerce")
-    return out
