@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -454,7 +453,6 @@ def build_operational_base(df: pd.DataFrame) -> pd.DataFrame:
             default="Media",
         )
 
-    # columnas canónicas de entidades
     for label, col in entity_cols.items():
         canon = f"__entity_{label.lower().replace(' ', '_').replace('é','e').replace('ó','o')}__"
         if col is not None:
@@ -519,7 +517,7 @@ def build_filters(df: pd.DataFrame) -> pd.DataFrame:
             filtered = filtered[filtered["__channel__"].isin(channels_selected)]
 
     country_available = sorted(filtered["__country__"].astype(str).dropna().unique().tolist())
-    if len(country_available) > 1 and "N/A" not in country_available[:1]:
+    if len(country_available) > 1:
         countries_selected = st.sidebar.multiselect(
             "País",
             options=country_available,
@@ -608,16 +606,13 @@ def build_entity_summary(
     agg["share_alertas_pct"] = 100 * agg["alertas"] / base_n
     agg["share_importe_pct"] = 100 * agg["importe_total"] / max(base_amount, 1)
 
-    # score relativo
     if pd.notna(base_avg_score) and base_avg_score > 0:
         agg["score_relativo"] = agg["score_medio"] / base_avg_score
     else:
         agg["score_relativo"] = 1.0
 
-    # intensidad
     agg["alertas_por_dia_activo"] = agg["alertas"] / np.maximum(agg["dias_activos"], 1)
 
-    # score de sospecha compuesto y estable
     def robust_z(s: pd.Series) -> pd.Series:
         if s.nunique(dropna=True) <= 1:
             return pd.Series(np.zeros(len(s)), index=s.index)
@@ -650,14 +645,19 @@ def build_entity_summary(
     agg["flag_score_alto"] = agg["score_relativo"] >= 1.25
     agg["flag_intensidad"] = agg["alertas_por_dia_activo"] >= agg["alertas_por_dia_activo"].quantile(0.75)
 
-    agg["motivo_operativo"] = (
-        np.where(agg["flag_concentracion_alertas"], "Alta concentración de alertas; ", "") +
-        np.where(agg["flag_concentracion_importe"], "Alta concentración de importe; ", "") +
-        np.where(agg["flag_score_alto"], "Score medio superior al baseline; ", "") +
-        np.where(agg["flag_intensidad"], "Alta recurrencia por día activo; ", "")
-    ).str.strip()
+    agg["motivo_operativo"] = pd.Series("", index=agg.index, dtype="object")
+    agg.loc[agg["flag_concentracion_alertas"], "motivo_operativo"] += "Alta concentración de alertas; "
+    agg.loc[agg["flag_concentracion_importe"], "motivo_operativo"] += "Alta concentración de importe; "
+    agg.loc[agg["flag_score_alto"], "motivo_operativo"] += "Score medio superior al baseline; "
+    agg.loc[agg["flag_intensidad"], "motivo_operativo"] += "Alta recurrencia por día activo; "
 
-    agg["motivo_operativo"] = agg["motivo_operativo"].replace("", "Patrón persistente a monitorizar")
+    agg["motivo_operativo"] = (
+        agg["motivo_operativo"]
+        .fillna("")
+        .str.strip()
+        .str.rstrip(";")
+        .replace("", "Patrón persistente a monitorizar")
+    )
 
     agg = agg.sort_values(
         by=["suspicion_score_norm", "alertas", "importe_total", "score_medio"],
@@ -937,9 +937,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =========================================================
-# DATA
-# =========================================================
 try:
     raw_df = load_dashboard_data()
     df = build_operational_base(raw_df)
@@ -958,9 +955,6 @@ if not entity_options:
     st.warning("El dataset actual no incluye dimensiones de entidad utilizables para esta vista.")
     st.stop()
 
-# =========================================================
-# CONFIG DE ENTIDAD
-# =========================================================
 st.subheader("Configuración de análisis")
 st.caption("Selecciona la dimensión operativa sobre la que quieres detectar concentración de riesgo.")
 
@@ -979,7 +973,6 @@ if summary_df.empty:
     st.warning("No hay entidades con suficiente volumen bajo los filtros actuales.")
     st.stop()
 
-# Añadir mix de prioridad para visuales
 priority_mix = (
     filtered_df.groupby([entity_col, "__priority__"], dropna=False)
     .size()
@@ -998,9 +991,6 @@ for col in ["prio_Crítica", "prio_Alta", "prio_Media", "prio_Baja"]:
     if col not in summary_df.columns:
         summary_df[col] = 0
 
-# =========================================================
-# KPIS
-# =========================================================
 total_entities = summary_df["entidad"].nunique()
 top1 = summary_df.iloc[0]
 share_top1_alertas = float(top1["share_alertas_pct"])
@@ -1032,18 +1022,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =========================================================
-# LECTURA EJECUTIVA
-# =========================================================
 st.subheader("Lectura ejecutiva / operativa")
 st.caption("Resumen breve para identificar si existe concentración de riesgo en un conjunto reducido de entidades.")
 
 for bullet in build_entity_readout(summary_df):
     st.markdown(f"- {bullet}")
 
-# =========================================================
-# VISUALES PRINCIPALES
-# =========================================================
 st.subheader("Mapa de entidades sospechosas")
 st.caption("Combina frecuencia, importe y score para localizar entidades que merecen investigación específica.")
 
@@ -1065,9 +1049,6 @@ with c2:
     )
     st.plotly_chart(plot_top_entities_bar(summary_df, top_n), use_container_width=True)
 
-# =========================================================
-# CONCENTRACIÓN Y PRIORIDAD
-# =========================================================
 st.subheader("Concentración operativa")
 st.caption("Permite ver si las entidades más sospechosas también están generando la parte alta de la cola.")
 
@@ -1077,9 +1058,6 @@ st.markdown(
 )
 st.plotly_chart(plot_priority_mix_for_top_entities(summary_df, min(top_n, 10)), use_container_width=True)
 
-# =========================================================
-# TABLA PRINCIPAL
-# =========================================================
 st.subheader("Tabla de entidades")
 st.caption("Detalle analítico para inspección, priorización y posible apertura de investigación.")
 
@@ -1145,18 +1123,14 @@ st.dataframe(
     hide_index=True,
 )
 
-# =========================================================
-# EXPLORADOR DE ENTIDAD
-# =========================================================
 st.subheader("Explorador de entidad")
 st.caption("Permite abrir una entidad concreta para ver su evolución temporal, su distribución de riesgo y sus coocurrencias operativas.")
 
 entity_values = summary_df["entidad"].astype(str).tolist()
-default_idx = 0
 selected_entity_value = st.selectbox(
     f"Selecciona una {entity_label.lower()}",
     options=entity_values,
-    index=default_idx,
+    index=0,
 )
 
 selected_row = summary_df[summary_df["entidad"].astype(str) == str(selected_entity_value)].iloc[0]
@@ -1204,9 +1178,6 @@ with c2:
         use_container_width=True,
     )
 
-# =========================================================
-# COOCURRENCIAS
-# =========================================================
 st.subheader("Coocurrencias operativas")
 st.caption("Muestra otros identificadores que aparecen repetidamente junto a la entidad seleccionada.")
 
@@ -1219,9 +1190,6 @@ else:
         hide_index=True,
     )
 
-# =========================================================
-# CUELLOS / HALLAZGOS
-# =========================================================
 st.subheader("Hallazgos operativos")
 st.caption("Conclusiones rápidas sobre concentración, persistencia y posible foco de investigación.")
 
@@ -1237,9 +1205,6 @@ bullets = [
 for b in bullets:
     st.markdown(f"- {b}")
 
-# =========================================================
-# NOTA FINAL
-# =========================================================
 st.markdown("---")
 st.markdown(
     """
