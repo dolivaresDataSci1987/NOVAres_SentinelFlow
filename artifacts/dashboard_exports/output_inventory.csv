@@ -1,0 +1,28 @@
+output_name,description
+dashboard_scored_transactions,Master scored transaction table for dashboard filters and drill-downs.
+alert_queue,"Transactions above champion threshold, sorted by fraud score."
+review_queue_top_1pct,Highest-risk top 1% review queue.
+review_queue_top_3pct,Highest-risk top 3% review queue.
+review_queue_top_5pct,Highest-risk top 5% review queue.
+review_queue_top_10pct,Highest-risk top 10% review queue.
+executive_kpis,Executive KPI table for overview cards and summary sections.
+daily_monitoring,Daily monitoring metrics over the scored test period.
+daily_channel_monitoring,Daily monitoring broken down by channel.
+channel_summary,Risk and alert summary by channel.
+merchant_category_summary,Risk and alert summary by merchant category.
+customer_segment_summary,Risk and alert summary by customer segment.
+payment_type_summary,Risk and alert summary by payment type.
+merchant_risk_level_summary,Risk and alert summary by merchant risk level.
+transaction_country_summary,Risk and alert summary by transaction country.
+suspicious_customers,Customer-level suspiciousness table.
+suspicious_merchants,Merchant-level suspiciousness table.
+suspicious_devices,Device-level suspiciousness table.
+suspicious_payment_methods,Payment-method-level suspiciousness table.
+alert_composition,Composition of alerts by prediction outcome.
+alert_mix_by_channel,Alert composition by channel.
+alert_mix_by_merchant_category,Alert composition by merchant category.
+queue_summary,Operational review queue summary by capacity level.
+top_scored_transactions,Top scored transactions regardless of outcome.
+top_true_positive_cases,Top detected fraud cases.
+top_false_positive_cases,Top suspicious but non-fraud cases.
+top_false_negative_cases,Missed fraud cases for analysis.
